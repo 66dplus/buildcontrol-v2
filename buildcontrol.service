@@ -1,0 +1,15 @@
+[Unit]
+Description=BuildControl Upload API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/buildcontrol
+ExecStart=/opt/buildcontrol/venv/bin/uvicorn app.webhook_handler:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/buildcontrol/.env
+
+[Install]
+WantedBy=multi-user.target

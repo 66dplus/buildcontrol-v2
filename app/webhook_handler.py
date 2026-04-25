@@ -1,0 +1,1734 @@
+"""
+FastAPI HTTP endpoint for Excel file upload + Bitrix24 import.
+Deployed on VPS, receives file uploads and triggers the import pipeline.
+
+Endpoints:
+    POST /upload  — upload .xlsx file, runs full import, returns JSON result
+    GET  /health  — health check
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, Optional
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+# Ensure project root is in path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from bitrix.client import BitrixClient
+from bitrix.methods import lists, tasks as tasks_methods, workgroups
+from config import settings
+from scripts.import_excel import ExcelImporter
+from utils.cascade import cascade_update_task, cascade_update_budget
+from app.notifications.alerts import (
+    check_price_overrun,
+    check_consumption_ratio,
+    check_warehouse_balance,
+    check_budget_threshold,
+    check_schedule_slippage,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# In-memory store for async import jobs: job_id → {status, filename, result?, error?}
+_import_jobs: Dict[str, Dict[str, Any]] = {}
+_LIST_META_TTL_SECONDS = 60.0
+_PROJECT_LISTS_CACHE: Dict[int, tuple[float, list[dict[str, Any]]]] = {}
+_LIST_META_CACHE: Dict[
+    tuple[int, str],
+    tuple[float, tuple[int, str, dict[str, int]]],
+] = {}
+
+
+def _cache_get(
+    cache: Dict[Any, tuple[float, Any]],
+    key: Any,
+) -> Optional[Any]:
+    """Return cached value if fresh, otherwise None."""
+    cached = cache.get(key)
+    if not cached:
+        return None
+    expires_at, value = cached
+    if time.monotonic() >= expires_at:
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(
+    cache: Dict[Any, tuple[float, Any]],
+    key: Any,
+    value: Any,
+    ttl_seconds: float = _LIST_META_TTL_SECONDS,
+) -> None:
+    """Store a value in a simple in-memory TTL cache."""
+    cache[key] = (time.monotonic() + ttl_seconds, value)
+
+
+async def _get_project_lists_cached(
+    client: BitrixClient,
+    project_id: int,
+) -> list[dict[str, Any]]:
+    """Get project's universal lists with 60s in-memory cache."""
+    cached = _cache_get(_PROJECT_LISTS_CACHE, project_id)
+    if cached is not None:
+        return cached
+    all_lists = await lists.get_lists(client, project_id)
+    _cache_set(_PROJECT_LISTS_CACHE, project_id, all_lists)
+    return all_lists
+
+
+async def _get_list_meta_cached(
+    client: BitrixClient,
+    project_id: int,
+    name_keyword: str,
+) -> Optional[tuple[int, str, dict[str, int]]]:
+    """
+    Resolve list metadata (list id, iblock code, field map) with 60s cache.
+
+    Elements are intentionally not cached to keep task/resource values fresh.
+    """
+    cache_key = (project_id, (name_keyword or "").strip().lower())
+    cached = _cache_get(_LIST_META_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    all_lists = await _get_project_lists_cached(client, project_id)
+    target = lists.find_list_by_keyword(all_lists, name_keyword)
+    if not target:
+        return None
+
+    list_id = int(target["ID"])
+    iblock_code = target.get("IBLOCK_CODE", "")
+    fields_resp = await lists.get_fields(client, list_id, iblock_code, project_id)
+    field_map = lists.resolve_field_map(fields_resp)
+    meta = (list_id, iblock_code, field_map)
+    _cache_set(_LIST_META_CACHE, cache_key, meta)
+    return meta
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Startup/shutdown: manage APScheduler for daily digest."""
+    from app.notifications.digest import send_morning_digest
+
+    scheduler = AsyncIOScheduler()
+    if settings.notifications_enabled:
+        scheduler.add_job(
+            send_morning_digest,
+            "cron",
+            hour=9,
+            minute=0,
+            timezone="Europe/Moscow",
+            id="morning_digest",
+        )
+        scheduler.start()
+        logger.info("Notification scheduler started — morning digest at 09:00 MSK")
+    else:
+        logger.info("Notifications disabled — scheduler not started")
+
+    yield
+
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("Notification scheduler stopped")
+
+
+app = FastAPI(
+    title="BuildControl Upload API",
+    description="Upload Excel file → auto-create Bitrix24 project + lists + tasks",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Allow Bitrix24 iframe to call /upload cross-origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+from app.bitrix_app import router as bitrix_router  # noqa: E402
+from app.approval_page import router as approval_router  # noqa: E402
+from app.telegram_bot import router as telegram_router  # noqa: E402
+app.include_router(bitrix_router)
+app.include_router(approval_router)
+app.include_router(telegram_router)
+
+
+@app.get("/health")
+async def health() -> dict:
+    """Health check endpoint."""
+    return {"status": "ok", "service": "BuildControl Upload API"}
+
+
+@app.post("/api/test-digest")
+async def test_digest() -> JSONResponse:
+    """Manually trigger the morning digest (for testing)."""
+    from app.notifications.digest import send_morning_digest
+    await send_morning_digest()
+    return JSONResponse(content={"status": "digest_sent"})
+
+
+async def _run_import_job(job_id: str, tmp_path: str, filename: str, custom_name: Optional[str]) -> None:
+    """Background task: run Excel import and store result in _import_jobs."""
+    try:
+        async with BitrixClient() as client:
+            importer = ExcelImporter(client)
+            result = await importer.import_file(tmp_path, custom_name=custom_name)
+        logger.info(f"[job={job_id}] Import complete: project_id={result['summary']['project_id']}")
+        _import_jobs[job_id]["status"] = "done"
+        _import_jobs[job_id]["result"] = result["summary"]
+    except Exception as e:
+        logger.error(f"[job={job_id}] Import failed for {filename}: {e}")
+        _import_jobs[job_id]["status"] = "error"
+        _import_jobs[job_id]["error"] = str(e)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.post("/upload")
+async def upload_excel(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    project_name: str = Form(default=""),
+) -> JSONResponse:
+    """
+    Upload an Excel file (.xlsx) and kick off a background import.
+
+    Returns immediately with a job_id. Poll GET /api/import-status/{job_id}
+    to track progress. Status values: "running" | "done" | "error".
+    """
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"File must be .xlsx or .xls, got: {file.filename}",
+        )
+
+    try:
+        settings.validate()
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"Server config error: {e}")
+
+    suffix = Path(file.filename).suffix
+    with tempfile.NamedTemporaryFile(
+        delete=False, suffix=suffix, prefix=Path(file.filename).stem + "_"
+    ) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    job_id = uuid.uuid4().hex[:10]
+    _import_jobs[job_id] = {"status": "running", "filename": file.filename}
+    logger.info(f"[job={job_id}] Received {file.filename} ({len(content)} bytes) → {tmp_path}")
+
+    custom_name = (project_name or "").strip() or None
+    background_tasks.add_task(_run_import_job, job_id, tmp_path, file.filename, custom_name)
+
+    return JSONResponse(status_code=202, content={"job_id": job_id, "status": "running"})
+
+
+@app.get("/api/import-status/{job_id}")
+async def import_status(job_id: str) -> JSONResponse:
+    """Poll import job status. Returns status + result/error when done."""
+    job = _import_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
+    return JSONResponse(content=job)
+
+
+# ---------------------------------------------------------------------------
+# Report API endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/projects")
+async def api_projects() -> JSONResponse:
+    """List all active projects for the report form dropdown."""
+    try:
+        settings.validate()
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"Server config error: {e}")
+
+    async with BitrixClient() as client:
+        projects = await workgroups.list_projects(client)
+    return JSONResponse(content=projects)
+
+
+def _filter_task_elements(
+    elements: list[dict[str, Any]],
+    field_map: dict[str, int],
+    etap: str,
+    zadacha: str,
+) -> list[dict[str, Any]]:
+    """Filter elements by (Этап, Задача) when both values are provided."""
+    if etap and zadacha:
+        return lists.find_elements_by_properties(
+            elements, field_map, {"Этап": etap, "Задача": zadacha},
+        )
+    return elements
+
+
+def _build_materials_payload(
+    elements: list[dict[str, Any]],
+    field_map: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Build API payload for materials list."""
+    pid_unit = next(
+        (pid for name, pid in field_map.items()
+         if any(kw in name.lower() for kw in ["ед.", "единиц", "ед.изм", "unit"])),
+        None,
+    )
+    pid_stock_mat = next(
+        (pid for name, pid in field_map.items() if "остаток" in name.lower()), None
+    )
+    pid_qty_plan_mat = next(
+        (pid for name, pid in field_map.items() if "объём план" in name.lower()), None
+    )
+    pid_qty_bought_mat = next(
+        (
+            pid for name, pid in field_map.items()
+            if "куплено" in name.lower() and "объём" in name.lower()
+        ),
+        None,
+    )
+    pid_price_plan_mat = next(
+        (
+            pid for name, pid in field_map.items()
+            if "цена ед" in name.lower() and "план" in name.lower()
+        ),
+        None,
+    )
+
+    materials: list[dict[str, Any]] = []
+    for elem in elements:
+        name = elem.get("NAME", "")
+        if not name:
+            continue
+
+        materials.append({
+            "name": name,
+            "unit": lists.get_prop_value_str(elem, pid_unit) if pid_unit else "",
+            "stock": float(lists.get_prop_value(elem, pid_stock_mat) or 0) if pid_stock_mat else None,
+            "qty_plan": float(lists.get_prop_value(elem, pid_qty_plan_mat) or 0) if pid_qty_plan_mat else None,
+            "qty_bought": float(lists.get_prop_value(elem, pid_qty_bought_mat) or 0) if pid_qty_bought_mat else None,
+            "price_plan": float(lists.get_prop_value(elem, pid_price_plan_mat) or 0) if pid_price_plan_mat else None,
+        })
+    return materials
+
+
+def _build_labor_payload(
+    elements: list[dict[str, Any]],
+    field_map: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Build API payload for labor list."""
+    pid_role = next(
+        (
+            pid for name, pid in field_map.items()
+            if any(kw in name.lower() for kw in ["должность", "роль", "специальность", "role"])
+        ),
+        None,
+    )
+    workers: list[dict[str, Any]] = []
+    for elem in elements:
+        name = elem.get("NAME", "")
+        if not name:
+            continue
+        workers.append({
+            "name": name,
+            "role": lists.get_prop_value_str(elem, pid_role) if pid_role else "",
+        })
+    return workers
+
+
+def _build_equipment_payload(
+    elements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build API payload for equipment list."""
+    equipment: list[dict[str, Any]] = []
+    for elem in elements:
+        name = elem.get("NAME", "")
+        if not name:
+            continue
+        equipment.append({"name": name})
+    return equipment
+
+
+def _build_subtasks_payload(
+    elements: list[dict[str, Any]],
+    field_map: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Build API payload for subtasks list."""
+    pid_deadline = lists._resolve_filter_pid(field_map, "ок. план")
+    if not pid_deadline:
+        pid_deadline = lists._resolve_filter_pid(field_map, "ок план")
+    pid_start_plan = lists._resolve_filter_pid(field_map, "нач. план")
+    if not pid_start_plan:
+        pid_start_plan = lists._resolve_filter_pid(field_map, "нач план")
+    pid_status = lists._resolve_filter_pid(field_map, "статус")
+    pid_date_start_fact = lists._resolve_filter_pid(field_map, "нач. факт")
+    if not pid_date_start_fact:
+        pid_date_start_fact = lists._resolve_filter_pid(field_map, "нач факт")
+    pid_date_done_fact = lists._resolve_filter_pid(field_map, "ок. факт")
+    if not pid_date_done_fact:
+        pid_date_done_fact = lists._resolve_filter_pid(field_map, "ок факт")
+    pid_bsubtask_id = lists._resolve_filter_pid(field_map, "bitrix subtask id")
+    pid_order = lists._resolve_filter_pid(field_map, "№")
+
+    subtasks: list[dict[str, Any]] = []
+    for elem in elements:
+        title = elem.get("NAME", "")
+        if not title:
+            continue
+        subtasks.append({
+            "element_id": int(elem.get("ID", 0)),
+            "title": title,
+            "order": int(lists.get_prop_value(elem, pid_order) or 0) if pid_order else 0,
+            "deadline_plan": lists.get_prop_value_str(elem, pid_deadline) if pid_deadline else None,
+            "date_start_plan": lists.get_prop_value_str(elem, pid_start_plan) if pid_start_plan else None,
+            "status": lists.get_prop_value_str(elem, pid_status) if pid_status else "Новая",
+            "date_fact_start": lists.get_prop_value_str(elem, pid_date_start_fact) if pid_date_start_fact else None,
+            "date_fact_done": lists.get_prop_value_str(elem, pid_date_done_fact) if pid_date_done_fact else None,
+            "bitrix_subtask_id": int(lists.get_prop_value(elem, pid_bsubtask_id) or 0) if pid_bsubtask_id else None,
+        })
+
+    subtasks.sort(key=lambda item: (item["order"], item["element_id"]))
+    return subtasks
+
+
+async def _load_task_context_payload(
+    client: BitrixClient,
+    project_id: int,
+    etap: str,
+    zadacha: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Load all task-linked resources/subtasks in one payload for widget speed."""
+    payload: dict[str, list[dict[str, Any]]] = {
+        "materials": [],
+        "labor": [],
+        "equipment": [],
+        "subtasks": [],
+    }
+
+    materials_ctx = await _get_list_context(client, project_id, "материал")
+    if materials_ctx:
+        _, _, field_map, elements = materials_ctx
+        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
+        payload["materials"] = _build_materials_payload(filtered, field_map)
+
+    labor_ctx = await _get_list_context(client, project_id, "трудозатрат")
+    if labor_ctx:
+        _, _, field_map, elements = labor_ctx
+        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
+        payload["labor"] = _build_labor_payload(filtered, field_map)
+
+    equipment_ctx = await _get_list_context(client, project_id, "техник")
+    if equipment_ctx:
+        _, _, field_map, elements = equipment_ctx
+        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
+        payload["equipment"] = _build_equipment_payload(filtered)
+
+    subtasks_ctx = await _get_list_context(client, project_id, "подзадач")
+    if subtasks_ctx:
+        _, _, field_map, elements = subtasks_ctx
+        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
+        payload["subtasks"] = _build_subtasks_payload(filtered, field_map)
+
+    return payload
+
+
+@app.get("/api/projects/{project_id}/materials")
+async def api_materials(project_id: int, request: Request) -> JSONResponse:
+    """
+    Return material names/units from the project's "3. Материалы" list.
+    Optional query params ?etap=X&zadacha=Y to filter by task.
+    """
+    etap = request.query_params.get("etap", "").strip()
+    zadacha = request.query_params.get("zadacha", "").strip()
+
+    async with BitrixClient() as client:
+        ctx = await _get_list_context(client, project_id, "материал")
+        if not ctx:
+            return JSONResponse(content=[])
+
+        _, _, field_map, elements = ctx
+        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
+        materials = _build_materials_payload(filtered, field_map)
+
+    return JSONResponse(content=materials)
+
+
+@app.get("/api/projects/{project_id}/labor")
+async def api_labor(project_id: int, request: Request) -> JSONResponse:
+    """
+    Return worker names/roles from the project's "4. Трудозатраты" list.
+    Optional query params ?etap=X&zadacha=Y to filter by task.
+    """
+    etap = request.query_params.get("etap", "").strip()
+    zadacha = request.query_params.get("zadacha", "").strip()
+
+    async with BitrixClient() as client:
+        ctx = await _get_list_context(client, project_id, "трудозатрат")
+        if not ctx:
+            return JSONResponse(content=[])
+
+        _, _, field_map, elements = ctx
+        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
+        workers = _build_labor_payload(filtered, field_map)
+
+    return JSONResponse(content=workers)
+
+
+@app.get("/api/projects/{project_id}/task-context")
+async def api_task_context(project_id: int, request: Request) -> JSONResponse:
+    """
+    Return materials, labor, equipment, and subtasks for one task in a single response.
+    Query params: ?etap=X&zadacha=Y
+    """
+    etap = request.query_params.get("etap", "").strip()
+    zadacha = request.query_params.get("zadacha", "").strip()
+
+    async with BitrixClient() as client:
+        payload = await _load_task_context_payload(client, project_id, etap, zadacha)
+
+    return JSONResponse(content=payload)
+
+
+@app.get("/api/projects/{project_id}/tasks")
+async def api_tasks(project_id: int) -> JSONResponse:
+    """
+    Return tasks from the project's "2. Этапы и задачи" list.
+    Each task has etap (phase) and zadacha (task name).
+    Filters out subtasks and de-duplicates collisions deterministically.
+    """
+    async with BitrixClient() as client:
+        ctx = await _get_list_context(client, project_id, "задач")
+        if not ctx:
+            return JSONResponse(content=[])
+
+        list_id, iblock_code, field_map, elements = ctx
+
+        pid_etap = lists._resolve_filter_pid(field_map, "этап")
+        pid_zadacha = lists._resolve_filter_pid(field_map, "задача")
+        pid_budget_plan = lists._resolve_filter_pid(field_map, "бюджет план")
+
+        pid_btask_id = lists._resolve_filter_pid(field_map, "bitrix task id")
+
+        try:
+            root_task_ids = await tasks_methods.list_root_task_ids(client, project_id)
+        except Exception as root_err:
+            logger.warning(f"Tasks API: failed to load root task IDs for project {project_id}: {root_err}")
+            root_task_ids = set()
+
+        task_candidates: list[dict[str, Any]] = []
+        for elem in elements:
+            etap = ""
+            zadacha = elem.get("NAME", "")
+            budget_plan = None
+            element_id = int(elem.get("ID", 0))
+            bitrix_task_id = None
+
+            if pid_etap:
+                etap = lists.get_prop_value_str(elem, pid_etap) or ""
+            if pid_zadacha:
+                zadacha = lists.get_prop_value_str(elem, pid_zadacha) or zadacha
+            if pid_budget_plan:
+                budget_plan = lists.get_prop_value(elem, pid_budget_plan)
+            if pid_btask_id:
+                raw = lists.get_prop_value(elem, pid_btask_id)
+                bitrix_task_id = int(raw) if raw else None
+
+            if not zadacha:
+                continue
+
+            # Keep only root Bitrix tasks when link ID is present
+            if bitrix_task_id and root_task_ids and bitrix_task_id not in root_task_ids:
+                continue
+
+            task_candidates.append({
+                "etap": etap,
+                "zadacha": zadacha,
+                "budget_plan": budget_plan,
+                "element_id": element_id,
+                "bitrix_task_id": bitrix_task_id,
+            })
+
+    task_candidates.sort(
+        key=lambda item: (
+            (item.get("etap") or "").lower(),
+            (item.get("zadacha") or "").lower(),
+            int(item.get("element_id") or 0),
+        )
+    )
+
+    task_list: list[dict[str, Any]] = []
+    seen_by_bitrix: set[int] = set()
+    seen_by_pair: set[tuple[str, str]] = set()
+
+    for item in task_candidates:
+        key = ((item.get("etap") or "").strip().lower(), (item.get("zadacha") or "").strip().lower())
+        if key in seen_by_pair:
+            continue
+        btask = item.get("bitrix_task_id")
+        if btask is not None:
+            if btask in seen_by_bitrix:
+                continue
+            seen_by_bitrix.add(int(btask))
+        seen_by_pair.add(key)
+        task_list.append(item)
+
+    return JSONResponse(content=task_list)
+
+
+_SYSTEM_TYPE_RU: Dict[str, str] = {
+    "NEW": "Новая",
+    "PROGRESS": "В процессе",
+    "WORK": "В работе",
+    "REVIEW": "На проверке",
+    "FINISH": "Завершена",
+}
+
+
+@app.get("/api/projects/{project_id}/stages")
+async def api_stages(project_id: int) -> JSONResponse:
+    """
+    Return kanban stages for the project workgroup.
+    Used by the foreman widget to populate the stage dropdown.
+    Titles are mapped to Russian for known SYSTEM_TYPE values.
+    """
+    async with BitrixClient() as client:
+        stages = await tasks_methods.get_task_stages(client, project_id)
+    result = []
+    for i, s in enumerate(stages):
+        sys_type = s.get("SYSTEM_TYPE") or None
+        if sys_type in _SYSTEM_TYPE_RU:
+            title = _SYSTEM_TYPE_RU[sys_type]
+        elif i == 0:
+            title = "Новая"
+            sys_type = "NEW"
+        elif i == len(stages) - 1:
+            title = "Завершена"
+            sys_type = "FINISH"
+        else:
+            title = s.get("TITLE", "")
+        result.append({
+            "id": int(s["ID"]),
+            "title": title,
+            "sort": int(s.get("SORT", 0)),
+            "system_type": sys_type,
+        })
+    return JSONResponse(content=result)
+
+
+@app.get("/api/projects/{project_id}/subtasks")
+async def api_subtasks(project_id: int, request: Request) -> JSONResponse:
+    """
+    Return subtasks for a specific (etap, zadacha) from the "6. Подзадачи" list.
+    Query params: ?etap=X&zadacha=Y
+    Used by the foreman form to show per-task subtask completion UI.
+    Returns empty list for v3 projects (no подзадачи list).
+    """
+    etap = request.query_params.get("etap", "").strip()
+    zadacha = request.query_params.get("zadacha", "").strip()
+
+    async with BitrixClient() as client:
+        ctx = await _get_list_context(client, project_id, "подзадач")
+        if not ctx:
+            return JSONResponse(content=[])
+
+        _, _, field_map, elements = ctx
+        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
+        result = _build_subtasks_payload(filtered, field_map)
+
+    return JSONResponse(content=result)
+
+
+@app.get("/api/projects/{project_id}/equipment")
+async def api_equipment(project_id: int, request: Request) -> JSONResponse:
+    """
+    Return equipment items from the project's "5. Техника" list.
+    Optional query params ?etap=X&zadacha=Y to filter by task.
+    """
+    etap = request.query_params.get("etap", "").strip()
+    zadacha = request.query_params.get("zadacha", "").strip()
+
+    async with BitrixClient() as client:
+        ctx = await _get_list_context(client, project_id, "техник")
+        if not ctx:
+            return JSONResponse(content=[])
+
+        _, _, field_map, elements = ctx
+        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
+        equipment = _build_equipment_payload(filtered)
+
+    return JSONResponse(content=equipment)
+
+
+async def _get_list_context(
+    client: BitrixClient,
+    project_id: int,
+    name_keyword: str,
+) -> Optional[tuple]:
+    """
+    Find a list by name keyword and return (list_id, iblock_code, field_map, elements).
+    Returns None if no matching list found.
+    """
+    meta = await _get_list_meta_cached(client, project_id, name_keyword)
+    if not meta:
+        return None
+
+    list_id, iblock_code, field_map = meta
+    elements = await lists.get_elements(client, list_id, iblock_code, project_id)
+    return list_id, iblock_code, field_map, elements
+
+
+def _compute_completion_pct(stages: list[dict], stage_id: int) -> float:
+    """
+    Compute % completion based on kanban stage position across ALL stages.
+    NEW (first stage) = 0%, FINISH (last stage) = 100%.
+    E.g. 3 stages: NEW(0%), In Progress(50%), Done(100%).
+    """
+    for i, s in enumerate(stages):
+        if int(s["ID"]) == stage_id:
+            denom = max(len(stages) - 1, 1)
+            return round(i / denom * 100, 1)
+    return 0.0
+
+
+def _resolve_stage_system_type(
+    stages: list[dict],
+    stage_id: int,
+) -> Optional[str]:
+    """
+    Resolve stage SYSTEM_TYPE by stage ID.
+
+    If Bitrix returns null SYSTEM_TYPE for custom stages, use position fallback:
+    first=NEW, last=FINISH, middle=PROGRESS.
+    """
+    for index, stage in enumerate(stages):
+        if int(stage["ID"]) != int(stage_id):
+            continue
+        system_type = stage.get("SYSTEM_TYPE") or None
+        if system_type:
+            return str(system_type)
+        if index == 0:
+            return "NEW"
+        if index == len(stages) - 1:
+            return "FINISH"
+        return "PROGRESS"
+    return None
+
+
+def _resolve_parent_stage_targets(stages: list[dict]) -> tuple[Optional[int], Optional[int]]:
+    """
+    Return (progress_stage_id, finish_stage_id) for parent task auto-move logic.
+
+    - Progress stage: first stage with SYSTEM_TYPE in PROGRESS/WORK/REVIEW;
+      if none resolved, fallback to the second stage by SORT.
+    - Finish stage: last stage by SORT.
+    """
+    if not stages:
+        return None, None
+
+    progress_stage_id: Optional[int] = None
+    finish_stage_id = int(stages[-1]["ID"])
+
+    for index, stage in enumerate(stages):
+        stage_id = int(stage["ID"])
+        system_type = stage.get("SYSTEM_TYPE") or None
+        if not system_type:
+            if index == 0:
+                system_type = "NEW"
+            elif index == len(stages) - 1:
+                system_type = "FINISH"
+            else:
+                system_type = "PROGRESS"
+
+        if progress_stage_id is None and system_type in ("PROGRESS", "WORK", "REVIEW"):
+            progress_stage_id = stage_id
+
+    if progress_stage_id is None and len(stages) >= 2:
+        progress_stage_id = int(stages[1]["ID"])
+
+    return progress_stage_id, finish_stage_id
+
+
+async def _update_task_progress(
+    client: BitrixClient,
+    project_id: int,
+    task_etap: str,
+    task_zadacha: str,
+    stage_id: Optional[int],
+    comment: str,
+) -> None:
+    """
+    Move the Bitrix CRM task to a kanban stage, post a comment, and update
+    'Дата нач. факт' + '% выполнения факт' in the "2. Этапы и задачи" list.
+    All errors are logged as warnings — never raises to the caller.
+    """
+    if not stage_id and not comment:
+        return
+
+    try:
+        # --- Find list element for this (Этап, Задача) ---
+        ctx = await _get_list_context(client, project_id, "задач")
+        if not ctx:
+            logger.warning(f"Task progress: 'задач' list not found for project {project_id}")
+            return
+
+        list_id, iblock_code, field_map, elements = ctx
+
+        pid_etap = lists._resolve_filter_pid(field_map, "этап")
+        pid_zadacha = lists._resolve_filter_pid(field_map, "задача")
+        pid_btask_id = lists._resolve_filter_pid(field_map, "bitrix task id")
+        pid_start_fact = lists._resolve_filter_pid(field_map, "нач. факт")
+        if not pid_start_fact:
+            pid_start_fact = lists._resolve_filter_pid(field_map, "нач факт")
+        pid_end_fact = lists._resolve_filter_pid(field_map, "ок. факт")
+        if not pid_end_fact:
+            pid_end_fact = lists._resolve_filter_pid(field_map, "ок факт")
+        # "Готовн. Факт" is the existing Excel column for % completion (no extra field created).
+        # Must NOT match "Готовн. план" — so use a more specific keyword.
+        pid_pct_fact = lists._resolve_filter_pid(field_map, "готовн. факт")
+        if not pid_pct_fact:
+            pid_pct_fact = lists._resolve_filter_pid(field_map, "готовн факт")
+
+        # Find the matching element
+        matched = lists.find_elements_by_properties(
+            elements, field_map, {"Этап": task_etap, "Задача": task_zadacha},
+        )
+        if not matched:
+            # Fall back: match by NAME alone
+            matched = [e for e in elements if e.get("NAME", "").strip().lower() == task_zadacha.lower()]
+
+        elem = matched[0] if matched else None
+
+        # --- Resolve Bitrix CRM task ID ---
+        bitrix_task_id: Optional[int] = None
+        if elem and pid_btask_id:
+            raw = lists.get_prop_value(elem, pid_btask_id)
+            bitrix_task_id = int(raw) if raw else None
+
+        if not bitrix_task_id:
+            # Fallback: find by title
+            bitrix_task_id = await tasks_methods.find_task_by_title(client, project_id, task_zadacha)
+            if bitrix_task_id:
+                logger.info(f"Task progress: found task {bitrix_task_id} via title search for '{task_zadacha}'")
+            else:
+                logger.warning(f"Task progress: CRM task not found for '{task_zadacha}' in project {project_id}")
+
+        # --- Move to stage ---
+        all_stages: list[dict] = []
+        stage_system_type: Optional[str] = None
+        if stage_id and bitrix_task_id:
+            try:
+                all_stages = await tasks_methods.get_task_stages(client, project_id)
+                stage_system_type = _resolve_stage_system_type(all_stages, stage_id)
+                await tasks_methods.move_task_to_stage(client, bitrix_task_id, stage_id)
+                logger.info(f"Task progress: moved task {bitrix_task_id} to stage {stage_id} ({stage_system_type})")
+            except Exception as e:
+                logger.warning(f"Task progress: failed to move task {bitrix_task_id} to stage {stage_id}: {e}")
+
+        # --- Task lifecycle (start / complete) ---
+        if stage_id and bitrix_task_id and stage_system_type:
+            try:
+                if stage_system_type == "FINISH":
+                    await tasks_methods.complete_task(client, bitrix_task_id)
+                    logger.info(f"Task progress: completed task {bitrix_task_id}")
+                elif stage_system_type not in ("NEW",):
+                    await tasks_methods.start_task(client, bitrix_task_id)
+                    logger.info(f"Task progress: started task {bitrix_task_id}")
+            except Exception as e:
+                logger.warning(f"Task progress: lifecycle call failed for task {bitrix_task_id}: {e}")
+
+        # --- Add comment ---
+        if comment and bitrix_task_id:
+            try:
+                await tasks_methods.add_task_comment(client, bitrix_task_id, comment)
+                logger.info(f"Task progress: added comment to task {bitrix_task_id}")
+            except Exception as e:
+                logger.warning(f"Task progress: failed to add comment to task {bitrix_task_id}: {e}")
+
+        # --- Update list element (Дата нач. факт + Дата ок. факт + % выполнения факт) ---
+        if elem and stage_id:
+            elem_id = int(elem["ID"])
+            new_vals: Dict[int, Any] = lists.extract_all_prop_values(elem)
+
+            # Compute %
+            pct = _compute_completion_pct(all_stages, stage_id)
+            if pid_pct_fact:
+                new_vals[pid_pct_fact] = pct
+
+            is_new_stage = stage_system_type == "NEW"
+            is_finish_stage = stage_system_type == "FINISH"
+
+            # Set start date if element has none and stage is not NEW
+            if pid_start_fact and not is_new_stage:
+                cur_start = lists.get_prop_value_str(elem, pid_start_fact)
+                if not cur_start:
+                    new_vals[pid_start_fact] = datetime.now().date().isoformat()
+                    logger.info(f"Task progress: set Дата нач. факт for element {elem_id}")
+
+            # Set end date if stage is FINISH and not already set
+            if pid_end_fact and is_finish_stage:
+                cur_end = lists.get_prop_value_str(elem, pid_end_fact)
+                if not cur_end:
+                    new_vals[pid_end_fact] = datetime.now().date().isoformat()
+                    logger.info(f"Task progress: set Дата ок. факт for element {elem_id}")
+
+            if pid_pct_fact or pid_start_fact or pid_end_fact:
+                await lists.update_element(
+                    client, list_id, iblock_code, project_id, elem_id, new_vals,
+                    name=elem.get("NAME"),
+                )
+                logger.info(f"Task progress: updated element {elem_id} — % = {pct}")
+
+    except Exception as e:
+        logger.error(f"Task progress update failed [{task_etap}/{task_zadacha}]: {e}", exc_info=True)
+
+
+async def _update_subtask_progress(
+    client: BitrixClient,
+    project_id: int,
+    task_etap: str,
+    task_zadacha: str,
+    subtask_updates: list[dict],
+    comment: str,
+) -> None:
+    """
+    Mark subtasks as started/done, recompute parent task progress %, and
+    auto-advance the parent Kanban stage. All errors are logged — never raises.
+
+    subtask_updates: [{element_id: int, status: "started"|"done"}, ...]
+    """
+    if not subtask_updates and not comment:
+        return
+
+    try:
+        # --- Get подзадачи list ---
+        sub_ctx = await _get_list_context(client, project_id, "подзадач")
+        if not sub_ctx:
+            # No subtasks list — fall back to kanban-based progress (v3 project)
+            return
+
+        sub_list_id, sub_iblock, sub_field_map, sub_elements = sub_ctx
+
+        pid_status = lists._resolve_filter_pid(sub_field_map, "статус")
+        pid_start_fact = lists._resolve_filter_pid(sub_field_map, "нач. факт")
+        if not pid_start_fact:
+            pid_start_fact = lists._resolve_filter_pid(sub_field_map, "нач факт")
+        pid_end_fact = lists._resolve_filter_pid(sub_field_map, "ок. факт")
+        if not pid_end_fact:
+            pid_end_fact = lists._resolve_filter_pid(sub_field_map, "ок факт")
+        pid_bsubtask_id = lists._resolve_filter_pid(sub_field_map, "bitrix subtask id")
+
+        update_element_ids = {int(u["element_id"]) for u in subtask_updates if u.get("element_id")}
+        today_str = datetime.now().date().isoformat()
+        subtask_comment_lines: list[str] = []
+
+        for update in subtask_updates:
+            raw_elem_id = update.get("element_id")
+            status_req = update.get("status", "")  # "started" or "done"
+            if not raw_elem_id or not status_req:
+                continue
+
+            elem_id = int(raw_elem_id)
+            elem = next((e for e in sub_elements if int(e.get("ID", -1)) == elem_id), None)
+            if not elem:
+                logger.warning(f"Subtask progress: element {elem_id} not found in project {project_id}")
+                continue
+
+            new_vals: Dict[int, Any] = lists.extract_all_prop_values(elem)
+
+            if status_req == "started":
+                if pid_status:
+                    new_vals[pid_status] = "В работе"
+                if pid_start_fact:
+                    cur = lists.get_prop_value_str(elem, pid_start_fact)
+                    if not cur:
+                        new_vals[pid_start_fact] = today_str
+            elif status_req == "done":
+                if pid_status:
+                    new_vals[pid_status] = "Завершена"
+                if pid_start_fact:
+                    cur = lists.get_prop_value_str(elem, pid_start_fact)
+                    if not cur:
+                        new_vals[pid_start_fact] = today_str
+                if pid_end_fact:
+                    cur = lists.get_prop_value_str(elem, pid_end_fact)
+                    if not cur:
+                        new_vals[pid_end_fact] = today_str
+
+            await lists.update_element(
+                client, sub_list_id, sub_iblock, project_id, elem_id, new_vals,
+                name=elem.get("NAME"),
+            )
+            logger.info(f"Subtask progress: updated element {elem_id} → {status_req}")
+
+            sub_title = elem.get("NAME", f"element {elem_id}")
+            if status_req == "done":
+                subtask_comment_lines.append(f"✅ Подзадача выполнена: {sub_title}")
+            elif status_req == "started":
+                subtask_comment_lines.append(f"▶️ Подзадача начата: {sub_title}")
+
+        # --- Recompute parent task progress % ---
+        # Fetch all subtasks for this (Этап, Задача) fresh to get updated statuses
+        sub_elements_fresh = await lists.get_elements(client, sub_list_id, sub_iblock, project_id)
+        task_subtasks = lists.find_elements_by_properties(
+            sub_elements_fresh, sub_field_map, {"Этап": task_etap, "Задача": task_zadacha},
+        )
+
+        total = len(task_subtasks)
+        completed = 0
+        any_started = False
+        for e in task_subtasks:
+            st = lists.get_prop_value_str(e, pid_status) if pid_status else ""
+            if st and "завершен" in st.lower():
+                completed += 1
+            if st and ("работ" in st.lower() or "завершен" in st.lower()):
+                any_started = True
+
+        pct = round(completed / total * 100, 1) if total > 0 else 0.0
+
+        # --- Update задачи list element ---
+        task_ctx = await _get_list_context(client, project_id, "задач")
+        if task_ctx:
+            t_list_id, t_iblock, t_field_map, t_elements = task_ctx
+
+            pid_pct_fact = lists._resolve_filter_pid(t_field_map, "готовн. факт")
+            if not pid_pct_fact:
+                pid_pct_fact = lists._resolve_filter_pid(t_field_map, "готовн факт")
+            pid_t_start_fact = lists._resolve_filter_pid(t_field_map, "нач. факт")
+            if not pid_t_start_fact:
+                pid_t_start_fact = lists._resolve_filter_pid(t_field_map, "нач факт")
+            pid_t_end_fact = lists._resolve_filter_pid(t_field_map, "ок. факт")
+            if not pid_t_end_fact:
+                pid_t_end_fact = lists._resolve_filter_pid(t_field_map, "ок факт")
+            pid_btask_id = lists._resolve_filter_pid(t_field_map, "bitrix task id")
+
+            matched = lists.find_elements_by_properties(
+                t_elements, t_field_map, {"Этап": task_etap, "Задача": task_zadacha},
+            )
+            if not matched:
+                matched = [e for e in t_elements if e.get("NAME", "").strip().lower() == task_zadacha.lower()]
+
+            if matched:
+                t_elem = matched[0]
+                t_elem_id = int(t_elem["ID"])
+                t_vals: Dict[int, Any] = lists.extract_all_prop_values(t_elem)
+
+                if pid_pct_fact:
+                    t_vals[pid_pct_fact] = pct
+
+                if pid_t_start_fact and any_started:
+                    cur = lists.get_prop_value_str(t_elem, pid_t_start_fact)
+                    if not cur:
+                        t_vals[pid_t_start_fact] = today_str
+
+                if pid_t_end_fact and pct >= 100.0:
+                    cur = lists.get_prop_value_str(t_elem, pid_t_end_fact)
+                    if not cur:
+                        t_vals[pid_t_end_fact] = today_str
+
+                await lists.update_element(
+                    client, t_list_id, t_iblock, project_id, t_elem_id, t_vals,
+                    name=t_elem.get("NAME"),
+                )
+                logger.info(f"Subtask progress: parent task {task_zadacha} → {pct}% ({completed}/{total})")
+
+                # --- Auto-advance parent Kanban stage ---
+                bitrix_task_id: Optional[int] = None
+                if pid_btask_id:
+                    raw = lists.get_prop_value(t_elem, pid_btask_id)
+                    bitrix_task_id = int(raw) if raw else None
+                if not bitrix_task_id:
+                    bitrix_task_id = await tasks_methods.find_task_by_title(client, project_id, task_zadacha)
+
+                if bitrix_task_id:
+                    try:
+                        all_stages = await tasks_methods.get_task_stages(client, project_id)
+                        progress_stage_id, finish_stage_id = _resolve_parent_stage_targets(all_stages)
+                        if pct >= 100.0:
+                            if finish_stage_id:
+                                await tasks_methods.move_task_to_stage(client, bitrix_task_id, finish_stage_id)
+                                logger.info(
+                                    f"Subtask progress: moved parent task {bitrix_task_id} to FINISH stage {finish_stage_id}",
+                                )
+                            else:
+                                logger.warning(
+                                    f"Subtask progress: FINISH stage not resolved for project {project_id}",
+                                )
+                            await tasks_methods.complete_task(client, bitrix_task_id)
+                        elif any_started:
+                            if progress_stage_id:
+                                await tasks_methods.move_task_to_stage(client, bitrix_task_id, progress_stage_id)
+                                logger.info(
+                                    "Subtask progress: moved parent task "
+                                    f"{bitrix_task_id} to progress stage {progress_stage_id}",
+                                )
+                            else:
+                                logger.warning(
+                                    f"Subtask progress: PROGRESS stage not resolved for project {project_id}",
+                                )
+                            await tasks_methods.start_task(client, bitrix_task_id)
+                        logger.info(f"Subtask progress: Kanban+status synced for parent task {bitrix_task_id}")
+                    except Exception as e:
+                        logger.warning(f"Subtask progress: Kanban advance failed for task {bitrix_task_id}: {e}")
+
+                    # Post comment to parent task (auto subtask status lines + foreman manual comment)
+                    auto_msg = "\n".join(subtask_comment_lines)
+                    full_comment = "\n\n".join(filter(None, [auto_msg, comment]))
+                    if full_comment:
+                        try:
+                            await tasks_methods.add_task_comment(client, bitrix_task_id, full_comment)
+                        except Exception as e:
+                            logger.warning(f"Subtask progress: comment failed for task {bitrix_task_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"Subtask progress update failed [{task_etap}/{task_zadacha}]: {e}", exc_info=True)
+
+
+async def check_subtask_deadlines(
+    client: BitrixClient,
+    project_id: int,
+    project_name: str,
+    task_etap: str,
+    task_zadacha: str,
+) -> None:
+    """
+    Alert if any non-completed subtask has a deadline in the past.
+    Called after every foreman report submission.
+    """
+    from app.notifications.telegram import send_telegram
+    from app.notifications.alerts import _esc  # type: ignore[attr-defined]
+
+    try:
+        ctx = await _get_list_context(client, project_id, "подзадач")
+        if not ctx:
+            return
+
+        _, _, field_map, elements = ctx
+
+        pid_status = lists._resolve_filter_pid(field_map, "статус")
+        pid_deadline = lists._resolve_filter_pid(field_map, "ок. план")
+        if not pid_deadline:
+            pid_deadline = lists._resolve_filter_pid(field_map, "ок план")
+
+        subtasks = lists.find_elements_by_properties(
+            elements, field_map, {"Этап": task_etap, "Задача": task_zadacha},
+        )
+
+        today = datetime.now().date()
+        overdue: list[tuple[str, str]] = []  # (title, deadline_str)
+
+        for elem in subtasks:
+            status = lists.get_prop_value_str(elem, pid_status) if pid_status else ""
+            if status and "завершен" in status.lower():
+                continue
+
+            deadline_str = lists.get_prop_value_str(elem, pid_deadline) if pid_deadline else None
+            if not deadline_str:
+                continue
+
+            try:
+                deadline_date = datetime.strptime(deadline_str[:10], "%Y-%m-%d").date()
+                if deadline_date < today:
+                    overdue.append((elem.get("NAME", ""), deadline_str[:10]))
+            except ValueError:
+                pass
+
+        for sub_title, sub_deadline in overdue:
+            msg = (
+                f"⏰ <b>Подзадача просрочена</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏗 Проект: {_esc(project_name)}\n"
+                f"📋 Этап: {_esc(task_etap)}\n"
+                f"📌 Задача: {_esc(task_zadacha)}\n"
+                f"🔸 Подзадача: {_esc(sub_title)}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📅 Срок был: {sub_deadline}"
+            )
+            await send_telegram(msg)
+            logger.info(f"Subtask overdue alert sent: {sub_title} ({sub_deadline})")
+
+    except Exception as e:
+        logger.warning(f"check_subtask_deadlines failed [{task_etap}/{task_zadacha}]: {e}")
+
+
+@app.post("/api/buyer-report")
+async def api_buyer_report_legacy(request: Request) -> JSONResponse:
+    """
+    Deprecated. The buyer report no longer applies a purchase directly to "3. Материалы".
+
+    Procurement now goes through the approval flow at POST /api/purchase-request: the
+    buyer attaches a counterparty document, the approver reviews on /approval/{id}, and
+    only an Approve action moves the warehouse / weighted-price numbers.
+    """
+    return JSONResponse(
+        status_code=410,
+        content={
+            "success": False,
+            "error": "deprecated",
+            "detail": (
+                "POST /api/buyer-report removed. Use POST /api/purchase-request "
+                "(multipart/form-data) to submit a purchase request for approval."
+            ),
+        },
+    )
+
+
+@app.post("/api/purchase-request")
+async def api_purchase_request(
+    project_id: int = Form(...),
+    items_json: str = Form(...),
+    proposal: UploadFile = File(...),
+    buyer_comment: str = Form(default=""),
+) -> JSONResponse:
+    """
+    Submit a procurement approval request.
+
+    Form fields:
+        project_id     — Bitrix workgroup id (int)
+        items_json     — JSON array of {material_name, qty, price, unit?, price_plan?}
+        proposal       — REQUIRED commercial-proposal file (PDF only, ≤MAX_PROPOSAL_FILE_MB)
+        buyer_comment  — REQUIRED when any item's price exceeds its price_plan
+                         (justification of the overspend)
+
+    Author/etap/zadacha will be derived from the authenticated Bitrix user once
+    BX24.callMethod('user.current') is wired in. Until then we hardcode
+    author = "Закупщик" (user_id = 1).
+    """
+    from app.purchase_requests import create_request
+
+    try:
+        items = json.loads(items_json) if items_json else []
+        if not isinstance(items, list) or not items:
+            raise ValueError("items_json must be a non-empty array")
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"items_json invalid: {e}")
+
+    # Server-side enforcement of "comment required when price > plan".
+    over_plan_items = []
+    for it in items:
+        try:
+            price = float(it.get("price") or 0)
+            plan = float(it.get("price_plan") or 0)
+        except (TypeError, ValueError):
+            continue
+        if plan > 0 and price > plan:
+            over_plan_items.append(it.get("material_name") or "?")
+    if over_plan_items and not buyer_comment.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Комментарий обязателен: цена превышает план для позиций: "
+                + ", ".join(over_plan_items)
+            ),
+        )
+
+    file_bytes = await proposal.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Файл коммерческого предложения обязателен")
+    max_bytes = settings.max_proposal_file_mb * 1024 * 1024
+    if len(file_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds limit of {settings.max_proposal_file_mb} MB",
+        )
+    file_name = proposal.filename or "proposal.pdf"
+    ext = (file_name.split(".")[-1] or "").lower()
+    if ext != "pdf":
+        raise HTTPException(
+            status_code=415, detail="Допускаются только PDF-файлы",
+        )
+
+    project_name = f"Проект #{project_id}"
+    try:
+        async with BitrixClient() as client:
+            for p in await workgroups.list_projects(client):
+                if int(p["id"]) == project_id:
+                    project_name = p.get("name", project_name)
+                    break
+    except Exception:
+        pass
+
+    async with BitrixClient() as client:
+        result = await create_request(
+            client,
+            project_id=project_id,
+            project_name=project_name,
+            items=items,
+            file_name=file_name,
+            file_bytes=file_bytes,
+            author="Закупщик",
+            etap="",
+            zadacha="",
+            buyer_comment=buyer_comment.strip(),
+        )
+
+    return JSONResponse(content={
+        "success": True,
+        "request_id": result["request_id"],
+        "request_no": result["request_no"],
+        "task_id": result["task_id"],
+    })
+
+
+async def _background_report_tasks(
+    project_id: int,
+    tasks_entries: list,
+    report_project_name: str,
+) -> None:
+    """
+    Heavy post-report work: cascade updates, task progress, and notifications.
+    Runs in the background so the HTTP response is returned immediately.
+    """
+    for task_entry in tasks_entries:
+        task_etap      = task_entry.get("task_etap", "").strip()
+        task_zadacha   = task_entry.get("task_zadacha", "").strip()
+        materials      = task_entry.get("materials", [])
+        stage_id       = task_entry.get("stage_id")
+        task_comment   = task_entry.get("comment", "").strip()
+        subtask_updates = task_entry.get("subtask_updates", [])
+        if stage_id is not None:
+            try:
+                stage_id = int(stage_id)
+            except (TypeError, ValueError):
+                stage_id = None
+
+        # Cascade
+        if task_etap and task_zadacha:
+            try:
+                async with BitrixClient() as client:
+                    await cascade_update_task(client, project_id, task_etap, task_zadacha)
+                    await cascade_update_budget(client, project_id, task_etap)
+            except Exception as e:
+                logger.error(f"BG cascade failed [{task_etap}/{task_zadacha}]: {e}", exc_info=True)
+
+        # Task progress: subtask-based (v4) or kanban-based (v3) fallback
+        if task_etap and task_zadacha:
+            if subtask_updates:
+                try:
+                    async with BitrixClient() as client:
+                        await _update_subtask_progress(
+                            client, project_id, task_etap, task_zadacha,
+                            subtask_updates, task_comment,
+                        )
+                except Exception as e:
+                    logger.error(f"BG subtask progress failed [{task_etap}/{task_zadacha}]: {e}", exc_info=True)
+            elif stage_id or task_comment:
+                try:
+                    async with BitrixClient() as client:
+                        await _update_task_progress(
+                            client, project_id, task_etap, task_zadacha, stage_id, task_comment
+                        )
+                except Exception as e:
+                    logger.error(f"BG task progress failed [{task_etap}/{task_zadacha}]: {e}", exc_info=True)
+
+        # Notifications
+        try:
+            async with BitrixClient() as client:
+                for mat in materials:
+                    mat_name = mat.get("name", "").strip()
+                    if mat_name:
+                        await check_consumption_ratio(
+                            client, project_id, report_project_name, mat_name,
+                        )
+
+                mat_ctx = await _get_list_context(client, project_id, "материал")
+                if mat_ctx:
+                    _, _, _nf_fm, _nf_elems = mat_ctx
+                    _nf_pid_stock = next(
+                        (pid for n, pid in _nf_fm.items() if "остаток" in n.lower()), None
+                    )
+                    _nf_pid_plan = next(
+                        (pid for n, pid in _nf_fm.items() if "объём план" in n.lower()), None
+                    )
+                    _nf_pid_bought = next(
+                        (pid for n, pid in _nf_fm.items()
+                         if "куплено" in n.lower() and "объём" in n.lower()), None
+                    )
+                    for mat in materials:
+                        mat_name = mat.get("name", "").strip()
+                        if not mat_name:
+                            continue
+                        if task_etap and task_zadacha:
+                            _matched = lists.find_elements_by_properties(
+                                _nf_elems, _nf_fm,
+                                {"Этап": task_etap, "Задача": task_zadacha},
+                            )
+                            _elem = lists.find_element_by_name(_matched, mat_name)
+                        else:
+                            _elem = lists.find_element_by_name(_nf_elems, mat_name)
+                        if _elem and _nf_pid_stock and _nf_pid_plan:
+                            _stock = float(lists.get_prop_value(_elem, _nf_pid_stock) or 0)
+                            _plan = float(lists.get_prop_value(_elem, _nf_pid_plan) or 0)
+                            _bought = float(lists.get_prop_value(_elem, _nf_pid_bought) or 0) if _nf_pid_bought else 0.0
+                            await check_warehouse_balance(
+                                report_project_name, mat_name,
+                                _stock, _plan, _bought,
+                            )
+
+                if task_etap and task_zadacha:
+                    task_ctx = await _get_list_context(client, project_id, "задач")
+                    if task_ctx:
+                        _, _, _tf_fm, _tf_elems = task_ctx
+                        _matched_tasks = lists.find_elements_by_properties(
+                            _tf_elems, _tf_fm,
+                            {"Этап": task_etap, "Задача": task_zadacha},
+                        )
+                        if _matched_tasks:
+                            _te = _matched_tasks[0]
+                            _pid_bp = lists._resolve_filter_pid(_tf_fm, "бюджет план")
+                            _pid_bf = lists._resolve_filter_pid(_tf_fm, "бюджет факт")
+                            _pid_pct = lists._resolve_filter_pid(_tf_fm, "готовн. факт")
+                            if not _pid_pct:
+                                _pid_pct = lists._resolve_filter_pid(_tf_fm, "готовн факт")
+                            _pid_sp = next(
+                                (pid for n, pid in _tf_fm.items() if "нач" in n.lower() and "план" in n.lower()), None
+                            )
+                            _pid_ep = next(
+                                (pid for n, pid in _tf_fm.items() if "ок" in n.lower() and "план" in n.lower()), None
+                            )
+                            _pct_val = float(lists.get_prop_value(_te, _pid_pct) or 0) if _pid_pct else 0.0
+                            _bp_val = float(lists.get_prop_value(_te, _pid_bp) or 0) if _pid_bp else 0.0
+                            _bf_val = float(lists.get_prop_value(_te, _pid_bf) or 0) if _pid_bf else 0.0
+                            await check_budget_threshold(
+                                report_project_name, task_zadacha, task_etap,
+                                _bp_val, _bf_val, _pct_val,
+                            )
+                            _sp_val = lists.get_prop_value_str(_te, _pid_sp) if _pid_sp else None
+                            _ep_val = lists.get_prop_value_str(_te, _pid_ep) if _pid_ep else None
+                            await check_schedule_slippage(
+                                report_project_name, task_zadacha, task_etap,
+                                _sp_val, _ep_val, _pct_val,
+                            )
+
+                if task_etap and task_zadacha:
+                    await check_subtask_deadlines(
+                        client, project_id, report_project_name, task_etap, task_zadacha,
+                    )
+        except Exception as notif_err:
+            logger.warning(f"BG notifications failed: {notif_err}")
+
+
+@app.post("/api/report")
+async def api_report(request: Request, background: BackgroundTasks) -> JSONResponse:
+    """
+    Submit a foreman daily report.
+    Creates a report element, syncs materials/labor/equipment, and cascades to tasks/budget.
+    """
+    body = await request.json()
+
+    project_id = body.get("project_id")
+    report_date = body.get("date", "")
+    comments = body.get("comments", "")
+
+    # Support both new multi-task format (tasks=[]) and legacy flat format
+    tasks_entries = body.get("tasks", [])
+    if not tasks_entries:
+        # Legacy fallback: single task with flat materials/labor/equipment
+        tasks_entries = [{
+            "task_etap": body.get("task_etap", "").strip(),
+            "task_zadacha": body.get("task_zadacha", "").strip(),
+            "materials": body.get("materials", []),
+            "labor": body.get("labor", []),
+            "equipment": body.get("equipment", []),
+        }]
+
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+
+    project_id = int(project_id)
+
+    try:
+        async with BitrixClient() as client:
+            # Get or create the report list
+            report_info = await lists.get_or_create_report_list(client, project_id)
+            list_id = report_info["list_id"]
+            iblock_code = report_info["iblock_code"]
+            field_ids = report_info["field_ids"]
+
+            # Build field values
+            field_values: dict[int, str] = {}
+            if "f_0_date" in field_ids:
+                field_values[field_ids["f_0_date"]] = report_date
+            if "f_1_author" in field_ids:
+                field_values[field_ids["f_1_author"]] = "Прораб"  # MVP: no user context
+            if "f_2_comments" in field_ids:
+                field_values[field_ids["f_2_comments"]] = comments
+            if "f_3_materials" in field_ids:
+                all_mats = [m for t in tasks_entries for m in t.get("materials", [])]
+                field_values[field_ids["f_3_materials"]] = json.dumps(all_mats, ensure_ascii=False)
+            if "f_4_labor" in field_ids:
+                all_lab = [l for t in tasks_entries for l in t.get("labor", [])]
+                field_values[field_ids["f_4_labor"]] = json.dumps(all_lab, ensure_ascii=False)
+
+            element_code = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            element_id = await lists.add_element(
+                client,
+                list_id=list_id,
+                iblock_code=iblock_code,
+                group_id=project_id,
+                element_code=element_code,
+                name=f"Отчет {report_date}",
+                field_values=field_values,
+            )
+
+    except Exception as e:
+        logger.error(f"Report creation failed for project {project_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    logger.info(f"Report created: element_id={element_id} for project {project_id}")
+
+    # Resolve project name for notifications
+    _report_project_name = f"Проект #{project_id}"
+    try:
+        async with BitrixClient() as client:
+            _all_projects = await workgroups.list_projects(client)
+            for _p in _all_projects:
+                if int(_p["id"]) == project_id:
+                    _report_project_name = _p.get("name", _report_project_name)
+                    break
+    except Exception:
+        pass
+
+    # --- Sync each task entry's materials/labor/equipment (fast, synchronous) ---
+    for task_entry in tasks_entries:
+        task_etap    = task_entry.get("task_etap", "").strip()
+        task_zadacha = task_entry.get("task_zadacha", "").strip()
+        materials    = task_entry.get("materials", [])
+        labor        = task_entry.get("labor", [])
+        equipment    = task_entry.get("equipment", [])
+
+        # Sync materials into "3. Материалы"
+        if materials:
+            try:
+                async with BitrixClient() as client:
+                    ctx = await _get_list_context(client, project_id, "материал")
+                    if ctx:
+                        mat_list_id, mat_iblock, mat_field_map, mat_elements = ctx
+
+                        pid_qty_spent = next(
+                            (pid for fname, pid in mat_field_map.items() if "израсходовано" in fname.lower()),
+                            None,
+                        )
+                        pid_cost_spent = next(
+                            (pid for fname, pid in mat_field_map.items() if "стоим" in fname.lower() and "факт" in fname.lower()),
+                            None,
+                        )
+                        pid_stock = next(
+                            (pid for fname, pid in mat_field_map.items() if "остаток" in fname.lower()),
+                            None,
+                        )
+                        pid_price_fact = next(
+                            (pid for fname, pid in mat_field_map.items() if "цена ед" in fname.lower() and "факт" in fname.lower()),
+                            None,
+                        )
+                        pid_price_plan = next(
+                            (pid for fname, pid in mat_field_map.items() if "цена ед" in fname.lower() and "план" in fname.lower()),
+                            None,
+                        )
+
+                        for mat in materials:
+                            mat_name = mat.get("name", "").strip()
+                            qty_used = float(mat.get("quantity") or 0)
+                            if not mat_name or qty_used == 0:
+                                continue
+
+                            if task_etap and task_zadacha:
+                                matched = lists.find_elements_by_properties(
+                                    mat_elements, mat_field_map,
+                                    {"Этап": task_etap, "Задача": task_zadacha},
+                                )
+                                elem = lists.find_element_by_name(matched, mat_name)
+                            else:
+                                elem = lists.find_element_by_name(mat_elements, mat_name)
+
+                            if not elem:
+                                logger.warning(f"Report sync: material '{mat_name}' not found in project {project_id}")
+                                continue
+                            element_id_mat = int(elem["ID"])
+
+                            new_vals: Dict[int, Any] = lists.extract_all_prop_values(elem)
+
+                            if pid_qty_spent:
+                                cur = lists.get_prop_value(elem, pid_qty_spent) or 0.0
+                                new_vals[pid_qty_spent] = cur + qty_used
+
+                            if pid_stock:
+                                cur = lists.get_prop_value(elem, pid_stock) or 0.0
+                                new_vals[pid_stock] = max(0.0, cur - qty_used)
+
+                            if pid_cost_spent:
+                                price = (
+                                    (lists.get_prop_value(elem, pid_price_fact) if pid_price_fact else None)
+                                    or (lists.get_prop_value(elem, pid_price_plan) if pid_price_plan else None)
+                                    or 0.0
+                                )
+                                cur = lists.get_prop_value(elem, pid_cost_spent) or 0.0
+                                new_vals[pid_cost_spent] = cur + qty_used * price
+
+                            if new_vals:
+                                await lists.update_element(client, mat_list_id, mat_iblock, project_id, element_id_mat, new_vals, name=mat_name)
+                                logger.info(f"Report sync: updated material '{mat_name}' [{task_etap}/{task_zadacha}]")
+            except Exception as sync_err:
+                logger.error(f"Report sync (materials) failed for project {project_id}: {sync_err}", exc_info=True)
+
+        # Sync labor into "4. Трудозатраты"
+        if labor:
+            try:
+                async with BitrixClient() as client:
+                    ctx = await _get_list_context(client, project_id, "трудозатрат")
+                    if ctx:
+                        lab_list_id, lab_iblock, lab_field_map, lab_elements = ctx
+
+                        pid_hours_fact = next(
+                            (pid for fname, pid in lab_field_map.items() if "факт" in fname.lower() and "час" in fname.lower()),
+                            None,
+                        )
+                        pid_rate = next(
+                            (pid for fname, pid in lab_field_map.items() if "ставка" in fname.lower()),
+                            None,
+                        )
+                        pid_fot_fact = next(
+                            (pid for fname, pid in lab_field_map.items() if "фот" in fname.lower() and "факт" in fname.lower()),
+                            None,
+                        )
+
+                        for worker in labor:
+                            worker_name = worker.get("worker_name", "").strip()
+                            hours = float(worker.get("hours") or 0)
+                            if not worker_name or hours == 0:
+                                continue
+
+                            if task_etap and task_zadacha:
+                                matched = lists.find_elements_by_properties(
+                                    lab_elements, lab_field_map,
+                                    {"Этап": task_etap, "Задача": task_zadacha},
+                                )
+                                elem = lists.find_element_by_name(matched, worker_name)
+                            else:
+                                elem = lists.find_element_by_name(lab_elements, worker_name)
+
+                            if not elem:
+                                logger.warning(f"Report sync: worker '{worker_name}' not found in project {project_id}")
+                                continue
+                            element_id_lab = int(elem["ID"])
+
+                            new_vals_lab: Dict[int, Any] = lists.extract_all_prop_values(elem)
+
+                            if pid_hours_fact:
+                                cur = lists.get_prop_value(elem, pid_hours_fact) or 0.0
+                                total_hours = cur + hours
+                                new_vals_lab[pid_hours_fact] = total_hours
+
+                                if pid_fot_fact and pid_rate:
+                                    rate = lists.get_prop_value(elem, pid_rate) or 0.0
+                                    new_vals_lab[pid_fot_fact] = round(total_hours * rate, 2)
+
+                            if new_vals_lab:
+                                await lists.update_element(client, lab_list_id, lab_iblock, project_id, element_id_lab, new_vals_lab, name=worker_name)
+                                logger.info(f"Report sync: updated labor '{worker_name}' [{task_etap}/{task_zadacha}]")
+            except Exception as sync_err:
+                logger.error(f"Report sync (labor) failed for project {project_id}: {sync_err}", exc_info=True)
+
+        # Sync equipment into "5. Техника"
+        if equipment:
+            try:
+                async with BitrixClient() as client:
+                    ctx = await _get_list_context(client, project_id, "техник")
+                    if ctx:
+                        eq_list_id, eq_iblock, eq_field_map, eq_elements = ctx
+
+                        pid_hours_fact_eq = next(
+                            (pid for fname, pid in eq_field_map.items() if "факт" in fname.lower() and "час" in fname.lower()),
+                            None,
+                        )
+                        pid_price_hour = next(
+                            (pid for fname, pid in eq_field_map.items() if "цена" in fname.lower() and "час" in fname.lower()),
+                            None,
+                        )
+                        pid_total_fact = next(
+                            (pid for fname, pid in eq_field_map.items() if "итого" in fname.lower() and "факт" in fname.lower()),
+                            None,
+                        )
+
+                        for eq in equipment:
+                            eq_name = eq.get("name", "").strip()
+                            hours = float(eq.get("hours") or 0)
+                            if not eq_name or hours == 0:
+                                continue
+
+                            if task_etap and task_zadacha:
+                                matched = lists.find_elements_by_properties(
+                                    eq_elements, eq_field_map,
+                                    {"Этап": task_etap, "Задача": task_zadacha},
+                                )
+                                elem = lists.find_element_by_name(matched, eq_name)
+                            else:
+                                elem = lists.find_element_by_name(eq_elements, eq_name)
+
+                            if not elem:
+                                logger.warning(f"Report sync: equipment '{eq_name}' not found in project {project_id}")
+                                continue
+                            element_id_eq = int(elem["ID"])
+
+                            new_vals_eq: Dict[int, Any] = lists.extract_all_prop_values(elem)
+
+                            if pid_hours_fact_eq:
+                                cur = lists.get_prop_value(elem, pid_hours_fact_eq) or 0.0
+                                total_hours = cur + hours
+                                new_vals_eq[pid_hours_fact_eq] = total_hours
+
+                                if pid_total_fact and pid_price_hour:
+                                    qty = lists.get_prop_value(elem, lists._resolve_filter_pid(eq_field_map, "кол-во") or 0) or 1.0
+                                    price = lists.get_prop_value(elem, pid_price_hour) or 0.0
+                                    new_vals_eq[pid_total_fact] = round(qty * price * total_hours, 2)
+
+                            if new_vals_eq:
+                                await lists.update_element(client, eq_list_id, eq_iblock, project_id, element_id_eq, new_vals_eq, name=eq_name)
+                                logger.info(f"Report sync: updated equipment '{eq_name}' [{task_etap}/{task_zadacha}]")
+            except Exception as sync_err:
+                logger.error(f"Report sync (equipment) failed for project {project_id}: {sync_err}", exc_info=True)
+
+        # Cascade, task progress, and notifications run in the background
+        # so the HTTP response is returned without waiting for them.
+        # (These account for ~35 extra sequential API calls.)
+
+    # Schedule cascade + task progress + notifications as background work
+    background.add_task(
+        _background_report_tasks,
+        project_id,
+        tasks_entries,
+        _report_project_name,
+    )
+
+    domain = settings.bitrix24_domain
+    return JSONResponse(content={
+        "success": True,
+        "element_id": element_id,
+        "link": f"https://{domain}/workgroups/group/{project_id}/lists/",
+    })
