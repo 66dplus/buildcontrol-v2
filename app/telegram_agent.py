@@ -1,12 +1,15 @@
 """
-AI agent for the director's Telegram queries.
+AI director agent for BuildControl Telegram bot.
 
-Uses OpenRouter (OpenAI-compatible API) with tool_use to answer
-natural-language questions about project status in Russian.
+Architecture: 2 tools only.
+  1. list_projects()      — fuzzy project-name resolution
+  2. query_database(sql)  — arbitrary SELECT against the local SQLite DB
 
-Adding write tools in the future:
-  register a new entry in TOOL_REGISTRY with schema + async handler.
-  The agent loop picks it up automatically.
+The agent's system prompt embeds the full schema knowledge base (db/schema_docs.py)
+so the LLM generates correct SQL and understands field semantics (e.g. qty_bought
+vs qty_consumed vs qty_stock) without any hardcoded field logic here.
+
+Adding new analytical capabilities = update SCHEMA_DOCS, not Python code.
 """
 
 from __future__ import annotations
@@ -15,12 +18,15 @@ import json
 import logging
 from typing import Any, Callable, Coroutine, Dict, List, Tuple
 
+import aiosqlite
 from openai import AsyncOpenAI
 
 from app.notifications.telegram import send_telegram
 from bitrix.client import BitrixClient
-from bitrix import project_analytics as analytics
+from bitrix.methods import workgroups
 from config import settings
+from db.database import get_db
+from db.schema_docs import SCHEMA_DOCS
 
 logger = logging.getLogger(__name__)
 
@@ -28,37 +34,44 @@ logger = logging.getLogger(__name__)
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """Ты ассистент директора строительной компании.
+SYSTEM_PROMPT = f"""Ты ассистент директора строительной компании.
 Отвечай ТОЛЬКО на русском языке.
-Используй Telegram Markdown — **жирный** для ключевых чисел и названий,
-— для пунктов, эмодзи в меру.
+Используй HTML-теги Telegram: <b>жирный</b> для ключевых чисел, эмодзи в меру.
 
-Твоя задача — предоставлять точную информацию о строительных проектах:
-прогресс, сроки, бюджет план/факт, отклонения.
+{SCHEMA_DOCS}
 
-Правила:
-1. Если проект не назван явно — сначала вызови list_projects и предложи
-   пользователю выбрать из списка.
-2. Если проект упомянут нечётко — подбери наиболее похожее название из списка.
-3. Если ничего не найдено — ответь:
-   «Не могу найти проект. Вот доступные: <список>. Уточните название.»
-4. При показе бюджетов всегда указывай три категории:
-   Материалы / ФОТ (зарплата) / Техника — план и факт.
-5. Если факт > план — выдели это явно как отклонение.
-6. Для неизвестных запросов подскажи примеры:
-   «Прогресс по объекту X», «Бюджет этапа Y», «Что начнётся на этой неделе».
-7. Числа форматируй: 105 000 ₽ (пробел как разделитель тысяч).
-8. Даты в формате ДД.ММ.ГГГГ.
+== ПРАВИЛА РАБОТЫ ==
+1. Для ответа на вопрос:
+   а) Вызови list_projects() чтобы найти project_id по частичному совпадению имени.
+   б) Составь минимальный SQL-запрос, отвечающий именно на заданный вопрос.
+   в) Если результат выглядит неполным или пустым — уточни запрос и повтори (max 2 попытки).
+2. Отвечай ТОЛЬКО на то, о чём спросили. Не выдавай полный отчёт на каждый вопрос.
+   — Вопрос о закупках → только закупки.
+   — Вопрос о бюджете → только бюджет.
+   — Вопрос о задачах → только задачи и сроки.
+3. Закупки — строго различай:
+   qty_bought = куплено (поступило на склад), qty_consumed = израсходовано на объекте,
+   qty_stock = остаток на складе. В ответе указывай реальные единицы (л, м³, шт и т.д.).
+4. Бюджет: показывай использование, а не отклонение.
+   Формат: "<b>30 000 ₽</b> из 600 000 ₽ (5%)".
+   Жирный и предупреждение ⚠️ только если факт > план (перерасход).
+   ВАЖНО: для total_plan/total_actual всегда используй COALESCE через компоненты
+   (materials_plan + labor_plan + equipment_plan). Если итоговый план = 0 — НЕ пиши
+   "0 ₽ из 0 ₽": либо пропусти этап, либо сгруппируй как «без плана».
+5. Числа: 105 000 ₽. Даты: ДД.ММ.ГГГГ.
+6. Завершай каждый ответ 1–2 краткими предложениями с предложением уточнить:
+   "Хотите узнать [X]? Или показать [Y]?"
+7. Если данных нет — скажи прямо, не выдумывай. Если проект не найден через list_projects —
+   так и скажи, не сочиняй.
 """
 
 # ---------------------------------------------------------------------------
-# Tool registry: name → (json_schema, async handler)
+# Tool registry
 # ---------------------------------------------------------------------------
 
 ToolHandler = Callable[..., Coroutine[Any, Any, Any]]
 ToolEntry = Tuple[Dict[str, Any], ToolHandler]
 
-# Populated at module load; add new tools here to extend the agent.
 TOOL_REGISTRY: Dict[str, ToolEntry] = {}
 
 
@@ -70,144 +83,72 @@ def _register(schema: Dict[str, Any]) -> Callable[[ToolHandler], ToolHandler]:
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions + handlers
+# Tools
 # ---------------------------------------------------------------------------
 
 @_register({
     "type": "function",
     "function": {
         "name": "list_projects",
-        "description": "Вернуть список всех активных строительных проектов с их ID и названиями.",
+        "description": "Вернуть список всех активных строительных проектов с их ID и названиями. Вызывай первым для определения project_id.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
 })
 async def _tool_list_projects(**_: Any) -> Any:
-    async with BitrixClient() as client:
-        return await analytics.list_projects(client)
+    async with get_db() as conn:
+        async with conn.execute(
+            "SELECT id, name FROM projects WHERE is_archived=0 ORDER BY name"
+        ) as cur:
+            rows = await cur.fetchall()
+            return [{"id": r[0], "name": r[1]} for r in rows]
 
 
 @_register({
     "type": "function",
     "function": {
-        "name": "get_schedule_analysis",
+        "name": "query_database",
         "description": (
-            "Анализ выполнения задач по расписанию: что просрочено, что выполнено, "
-            "что в работе, что не начато. Включает бюджет факт по задачам."
+            "Выполнить SELECT-запрос к локальной базе данных проекта. "
+            "Возвращает список строк в виде объектов. "
+            "Используй схему из системного промпта для составления правильных запросов."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "project_id": {
-                    "type": "integer",
-                    "description": "ID проекта (из list_projects)",
-                },
-            },
-            "required": ["project_id"],
-        },
-    },
-})
-async def _tool_get_schedule_analysis(project_id: int, **_: Any) -> Any:
-    async with BitrixClient() as client:
-        return await analytics.get_schedule_analysis(client, project_id)
-
-
-@_register({
-    "type": "function",
-    "function": {
-        "name": "get_budget_overview",
-        "description": (
-            "Бюджет по этапам: план vs факт с разбивкой по категориям "
-            "(Материалы, ФОТ, Техника). Показывает отклонения."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "project_id": {
-                    "type": "integer",
-                    "description": "ID проекта (из list_projects)",
-                },
-            },
-            "required": ["project_id"],
-        },
-    },
-})
-async def _tool_get_budget_overview(project_id: int, **_: Any) -> Any:
-    async with BitrixClient() as client:
-        return await analytics.get_budget_overview(client, project_id)
-
-
-@_register({
-    "type": "function",
-    "function": {
-        "name": "get_resource_costs",
-        "description": (
-            "Детальные затраты по ресурсам: материалы, трудозатраты, техника — "
-            "каждая строка с планом и фактом. Можно фильтровать по этапу и задаче."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "project_id": {
-                    "type": "integer",
-                    "description": "ID проекта",
-                },
-                "etap": {
+                "sql": {
                     "type": "string",
-                    "description": "Название этапа для фильтрации (необязательно)",
-                },
-                "zadacha": {
-                    "type": "string",
-                    "description": "Название задачи для фильтрации (необязательно)",
-                },
+                    "description": "Корректный SQL SELECT-запрос к SQLite",
+                }
             },
-            "required": ["project_id"],
+            "required": ["sql"],
         },
     },
 })
-async def _tool_get_resource_costs(project_id: int, etap: str | None = None, zadacha: str | None = None, **_: Any) -> Any:
-    async with BitrixClient() as client:
-        return await analytics.get_resource_costs(client, project_id, etap=etap, zadacha=zadacha)
-
-
-@_register({
-    "type": "function",
-    "function": {
-        "name": "get_upcoming_tasks",
-        "description": "Задачи, которые начинаются или должны завершиться в ближайшие N дней.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "project_id": {
-                    "type": "integer",
-                    "description": "ID проекта",
-                },
-                "days": {
-                    "type": "integer",
-                    "description": "Окно в днях (по умолчанию 7)",
-                    "default": 7,
-                },
-            },
-            "required": ["project_id"],
-        },
-    },
-})
-async def _tool_get_upcoming_tasks(project_id: int, days: int = 7, **_: Any) -> Any:
-    async with BitrixClient() as client:
-        return await analytics.get_upcoming_tasks(client, project_id, days=days)
+async def _tool_query_database(sql: str, **_: Any) -> Any:
+    sql_clean = sql.strip().rstrip(";")
+    if not sql_clean.upper().lstrip().startswith("SELECT"):
+        return {"error": "Только SELECT-запросы разрешены"}
+    if "LIMIT" not in sql_clean.upper():
+        sql_clean += " LIMIT 200"
+    try:
+        async with get_db() as conn:
+            async with conn.execute(sql_clean) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.warning("query_database failed for sql=%r: %s", sql_clean, exc)
+        return {"error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
 
-_MAX_TOOL_ROUNDS = 6
+_MAX_TOOL_ROUNDS = 8
 
 
 async def handle_director_query(chat_id: int, text: str) -> None:
-    """
-    Entry point: receive a free-text message from the director,
-    run the tool-use loop, send the final response to Telegram.
-    """
+    """Entry point: run the tool-use loop, send final reply to Telegram."""
     if not settings.openrouter_api_key:
         logger.error("OPENROUTER_API_KEY not set — director agent disabled")
         await send_telegram(
@@ -250,14 +191,13 @@ async def handle_director_query(chat_id: int, text: str) -> None:
                 await send_telegram(reply or "Нет данных.", chat_id=str(chat_id))
                 return
 
-        # Fallback if we exhausted rounds without a final answer
         await send_telegram(
             "Не удалось получить ответ — слишком много шагов. Попробуйте уточнить вопрос.",
             chat_id=str(chat_id),
         )
 
     except Exception as exc:
-        logger.exception(f"Director agent error for chat {chat_id}: {exc}")
+        logger.exception("Director agent error for chat %s: %s", chat_id, exc)
         await send_telegram(
             "Произошла ошибка при обработке запроса. Попробуйте позже.",
             chat_id=str(chat_id),
@@ -265,7 +205,6 @@ async def handle_director_query(chat_id: int, text: str) -> None:
 
 
 async def _dispatch(name: str, arguments_json: str) -> Any:
-    """Call the registered tool handler by name."""
     entry = TOOL_REGISTRY.get(name)
     if not entry:
         return {"error": f"Неизвестный инструмент: {name}"}
@@ -274,5 +213,5 @@ async def _dispatch(name: str, arguments_json: str) -> Any:
         kwargs = json.loads(arguments_json) if arguments_json else {}
         return await handler(**kwargs)
     except Exception as exc:
-        logger.exception(f"Tool '{name}' raised: {exc}")
+        logger.exception("Tool '%s' raised: %s", name, exc)
         return {"error": str(exc)}

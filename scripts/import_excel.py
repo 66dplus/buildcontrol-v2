@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from bitrix.client import BitrixClient
 from bitrix.methods import lists, tasks, workgroups
 from config import settings
+from db.database import get_db
+from db import repo
 from utils.excel_parser import parse_excel_file, get_project_name
 
 
@@ -129,6 +131,13 @@ class ExcelImporter:
         logger.info(f"✓ Import complete: {json.dumps(result['summary'], ensure_ascii=False, indent=2)}")
         logger.info(f"🔗 Lists: https://{domain}/workgroups/group/{project_id}/lists/")
         logger.info(f"🔗 Tasks: https://{domain}/workgroups/group/{project_id}/tasks/")
+
+        # Populate SQLite for fast reads (agent, widget, approval tab)
+        try:
+            await self._sqlite_write(project_id, project_name, excel_data, task_id_map)
+        except Exception as exc:
+            logger.warning("SQLite write failed (Bitrix import succeeded): %s", exc)
+
         return result
 
     async def _create_project(self, name: str) -> int:
@@ -288,6 +297,12 @@ class ExcelImporter:
                         logger.info(f"Skipping ИТОГО row in sheet: {sheet_name}")
                         continue
 
+                    # Sheet 2 ("Этапы и задачи"): skip rows with empty Этап.
+                    # An empty Этап means the row has no phase to roll into "1. Бюджет".
+                    if is_zadach_sheet and not etap_val.strip():
+                        logger.debug(f"Skipping row {row_idx} in {sheet_name}: empty Этап")
+                        continue
+
                     # Map header -> field_id -> value
                     field_values = {
                         field_ids[h]: row_data.get(h)
@@ -406,6 +421,9 @@ class ExcelImporter:
                     continue
 
                 etap_val = str(row_data.get(etap_key, "")).strip() if etap_key else ""
+                if etap_key and not etap_val:
+                    logger.debug(f"Skipping row {row_idx}: empty Этап")
+                    continue
                 deadline = _to_iso_date(row_data.get(end_key) if end_key else None)
                 start_date_plan = _to_iso_date(row_data.get(start_key) if start_key else None)
 
@@ -458,6 +476,174 @@ class ExcelImporter:
 
         logger.info(f"✓ Created {len(task_ids)} tasks")
         return task_ids, task_id_map
+
+    # ------------------------------------------------------------------
+    # SQLite dual-write
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kw(keys: List[str], *keywords: str) -> Optional[str]:
+        """Return first key containing ALL keyword strings (case-insensitive)."""
+        for k in keys:
+            kl = k.lower()
+            if all(w in kl for w in keywords):
+                return k
+        return None
+
+    @staticmethod
+    def _val(row: Dict[str, Any], key: Optional[str]) -> Any:
+        return row.get(key) if key else None
+
+    @staticmethod
+    def _fval(row: Dict[str, Any], key: Optional[str]) -> float:
+        v = row.get(key) if key else None
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _sval(row: Dict[str, Any], key: Optional[str]) -> str:
+        v = row.get(key) if key else None
+        return str(v).strip() if v is not None else ""
+
+    async def _sqlite_write(
+        self,
+        project_id: int,
+        project_name: str,
+        excel_data: Dict[str, List[Dict[str, Any]]],
+        task_id_map: Dict[tuple, int],
+    ) -> None:
+        """Write all imported data into SQLite (runs after Bitrix writes succeed)."""
+        kw = self._kw
+        fv = self._fval
+        sv = self._sval
+
+        async with get_db() as conn:
+            await repo.upsert_project(conn, project_id, project_name)
+
+            for sheet_name, rows in excel_data.items():
+                if not rows:
+                    continue
+                sheet_lower = sheet_name.lower()
+                keys = list(rows[0].keys())
+
+                # ---- 1. Бюджет ----
+                if "бюджет" in sheet_lower:
+                    phase_key = keys[0]
+                    for row in rows:
+                        phase_name = sv(row, phase_key)
+                        if not phase_name or "итого" in phase_name.lower():
+                            continue
+                        mat_p = fv(row, kw(keys, "материал", "план"))
+                        lab_p = fv(row, kw(keys, "фот", "план"))
+                        eq_p  = fv(row, kw(keys, "техник", "план"))
+                        tot_p = fv(row, kw(keys, "итого", "план")) or (mat_p + lab_p + eq_p)
+                        await repo.upsert_budget_phase(
+                            conn, project_id, phase_name,
+                            materials_plan=mat_p, labor_plan=lab_p,
+                            equipment_plan=eq_p, total_plan=tot_p,
+                        )
+
+                # ---- 2. Этапы и задачи ----
+                elif "задач" in sheet_lower and "подзадач" not in sheet_lower:
+                    task_key = kw(keys, "задача")
+                    etap_key = next((k for k in keys if k.lower().strip() == "этап"), None)
+                    start_key = kw(keys, "нач", "план")
+                    end_key = kw(keys, "ок.", "план") or kw(keys, "окон", "план")
+                    budget_key = kw(keys, "бюджет", "план")
+                    for row in rows:
+                        task_name = sv(row, task_key)
+                        phase = sv(row, etap_key)
+                        if not task_name or not phase:
+                            continue
+                        bitrix_task_id = task_id_map.get((phase.lower(), task_name.lower()))
+                        d_start = None
+                        d_end = None
+                        if start_key:
+                            v = row.get(start_key)
+                            d_start = v.date().isoformat() if hasattr(v, "date") else (str(v).strip() if v else None)
+                        if end_key:
+                            v = row.get(end_key)
+                            d_end = v.date().isoformat() if hasattr(v, "date") else (str(v).strip() if v else None)
+                        await repo.upsert_task(
+                            conn, project_id, phase, task_name,
+                            bitrix_task_id=str(bitrix_task_id) if bitrix_task_id else None,
+                            date_start_plan=d_start,
+                            date_end_plan=d_end,
+                            budget_plan=fv(row, budget_key),
+                        )
+
+                # ---- 3. Материалы ----
+                elif "материал" in sheet_lower:
+                    name_key = kw(keys, "наименование")
+                    etap_key = next((k for k in keys if k.lower().strip() == "этап"), None)
+                    task_key = next((k for k in keys if "задача" in k.lower()), None)
+                    unit_key = kw(keys, "ед.")
+                    pp_key = kw(keys, "цена ед. план") or kw(keys, "цена", "план")
+                    qp_key = kw(keys, "объём план")
+                    cp_key = kw(keys, "стоим. план")
+                    for row in rows:
+                        mat_name = sv(row, name_key)
+                        phase = sv(row, etap_key)
+                        task = sv(row, task_key)
+                        if not mat_name or not phase or not task:
+                            continue
+                        await repo.upsert_material(
+                            conn, project_id, phase, task, mat_name,
+                            unit=sv(row, unit_key),
+                            price_plan=fv(row, pp_key),
+                            qty_plan=fv(row, qp_key),
+                            cost_plan=fv(row, cp_key),
+                        )
+
+                # ---- 4. Трудозатраты ----
+                elif "трудозатрат" in sheet_lower:
+                    deduped = _deduplicate_labor_rows(rows)
+                    spec_key = kw(keys, "специальность")
+                    etap_key = next((k for k in keys if k.lower().strip() == "этап"), None)
+                    task_key = next((k for k in keys if "задача" in k.lower()), None)
+                    rate_key = kw(keys, "ставка")
+                    hp_key = kw(keys, "ч-часов план") or kw(keys, "часов план")
+                    pp_key = kw(keys, "фот план")
+                    for row in deduped:
+                        spec = sv(row, spec_key)
+                        phase = sv(row, etap_key)
+                        task = sv(row, task_key)
+                        if not spec or not phase or not task:
+                            continue
+                        await repo.upsert_labor(
+                            conn, project_id, phase, task, spec,
+                            rate=fv(row, rate_key),
+                            hours_plan=fv(row, hp_key),
+                            payroll_plan=fv(row, pp_key),
+                        )
+
+                # ---- 5. Техника ----
+                elif "техник" in sheet_lower:
+                    name_key = kw(keys, "техника")
+                    etap_key = next((k for k in keys if k.lower().strip() == "этап"), None)
+                    task_key = next((k for k in keys if "задача" in k.lower()), None)
+                    price_key = kw(keys, "цена") or kw(keys, "ставка")
+                    hp_key = kw(keys, "часов план")
+                    tp_key = kw(keys, "итого план")
+                    for row in rows:
+                        eq_name = sv(row, name_key)
+                        phase = sv(row, etap_key)
+                        task = sv(row, task_key)
+                        if not eq_name or not phase or not task:
+                            continue
+                        hours_plan = fv(row, hp_key)
+                        price_ph = fv(row, price_key)
+                        total_p = fv(row, tp_key) or (hours_plan * price_ph)
+                        await repo.upsert_equipment(
+                            conn, project_id, phase, task, eq_name,
+                            price_per_hour=price_ph,
+                            hours_plan=hours_plan,
+                            total_plan=total_p,
+                        )
+
+        logger.info("✓ SQLite populated for project %d (%s)", project_id, project_name)
 
     @staticmethod
     def _infer_field_type(header: str, sample_value: Any = None) -> str:

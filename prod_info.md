@@ -1,7 +1,7 @@
 # BuildControl — Production Info
 
 > **Audience:** Anyone deploying, maintaining, or debugging this app on the VPS.  
-> **Last updated:** 2026-04-24
+> **Last updated:** 2026-04-26
 
 ---
 
@@ -34,6 +34,7 @@ ssh root@162.120.19.127
 | Web framework | FastAPI + Uvicorn |
 | Listens on | `http://localhost:8000` (not exposed directly) |
 | Public URL | Cloudflare Tunnel (see below) |
+| SQLite DB | `/opt/buildcontrol/buildcontrol.db` |
 
 ### Config file
 
@@ -46,6 +47,7 @@ Required keys:
 BITRIX24_WEBHOOK_URL=https://<domain>.bitrix24.com/rest/1/<token>/
 BITRIX24_DOMAIN=<domain>.bitrix24.com
 VPS_URL=https://<cloudflare-tunnel-url>.trycloudflare.com
+DB_PATH=/opt/buildcontrol/buildcontrol.db
 LOG_LEVEL=INFO
 
 # Telegram notifications (optional — app works without them)
@@ -158,6 +160,72 @@ Note: URL will still change if cloudflared restarts. For a **stable URL**, upgra
 
 ---
 
+## SQLite Database
+
+The app uses SQLite as its primary read database. Bitrix24 lists are kept as a display mirror.
+
+| Path | `/opt/buildcontrol/buildcontrol.db` |
+|---|---|
+| Tables | `projects`, `tasks`, `materials`, `labor`, `equipment_items`, `budget_phases`, `purchase_requests` |
+| Populated by | `scripts/import_excel.py` (dual-write on import) + report/purchase webhooks |
+
+### Inspect the database
+
+```bash
+sqlite3 /opt/buildcontrol/buildcontrol.db
+
+# Row counts per table
+SELECT 'projects', COUNT(*) FROM projects UNION ALL
+SELECT 'tasks', COUNT(*) FROM tasks UNION ALL
+SELECT 'materials', COUNT(*) FROM materials UNION ALL
+SELECT 'purchase_requests', COUNT(*) FROM purchase_requests;
+
+# Check fuel stock across all projects
+SELECT p.name, m.material_name, m.qty_stock, m.unit
+FROM materials m JOIN projects p ON p.id = m.project_id
+WHERE lower(m.material_name) LIKE '%топливо%';
+```
+
+### One-time migration (first deploy or new server)
+
+After deploying code to a server that has existing Bitrix data but an empty SQLite DB, run:
+
+```bash
+cd /opt/buildcontrol
+venv/bin/python3 scripts/migrate_bitrix_to_sqlite.py
+```
+
+This reads all projects and their 5 Universal Lists from Bitrix and inserts them into SQLite. Safe to re-run — uses `INSERT OR REPLACE` (idempotent). Takes ~30s per project due to Bitrix rate limiting.
+
+### Director AI agent QA
+
+Run the benchmark to verify the agent generates correct SQL. Use `--extended` to add 9 edge-case questions and automated DB sanity checks (exit code != 0 on any failure):
+
+```bash
+cd /opt/buildcontrol
+venv/bin/python3 scripts/test_agent_qa.py             # 15 base
+venv/bin/python3 scripts/test_agent_qa.py --extended  # 24 total + sanity checks
+```
+
+Each run writes a transcript to `/tmp/agent_qa_<ts>.log`.
+
+**If the agent reports "0 ₽ из 0 ₽" for a project**, the legacy `budget_phases.total_plan` rows are missing. Heal the live DB once:
+
+```bash
+venv/bin/python3 - <<'PY'
+import sqlite3
+c = sqlite3.connect("/opt/buildcontrol/buildcontrol.db")
+c.execute("""UPDATE budget_phases
+             SET total_plan   = COALESCE(NULLIF(total_plan,0),   materials_plan+labor_plan+equipment_plan),
+                 total_actual = COALESCE(NULLIF(total_actual,0), materials_actual+labor_actual+equipment_actual)""")
+c.commit()
+PY
+```
+
+Future imports already apply the fallback at write time (see migration script and Excel importer).
+
+---
+
 ## Deploy: Update the App
 
 Use this whenever you push new code changes.
@@ -265,7 +333,7 @@ curl http://localhost:8000/health
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/health` | Health check |
-| POST | `/upload` | Upload .xlsx → create project + lists + tasks (v3 or v4) |
+| POST | `/upload` | Upload .xlsx → pre-validates with openpyxl (returns 400 on parse error) before scheduling background import |
 | GET | `/api/projects` | List active (non-archived) projects |
 | GET | `/api/projects/{id}/tasks` | Root tasks from project's "2. Этапы и задачи" list (deduplicated) |
 | GET | `/api/projects/{id}/stages` | Kanban stages for the project workgroup |
@@ -278,7 +346,7 @@ curl http://localhost:8000/health
 | POST | `/api/buyer-report` | **Deprecated (HTTP 410)** — points to `/api/purchase-request` |
 | POST | `/api/purchase-request` | Submit a procurement approval request (multipart, REQUIRED `proposal` PDF, REQUIRED `buyer_comment` if any item priced over plan) |
 | GET | `/api/purchase-requests/pending` | List pending requests across projects (used by widget Согласование tab) |
-| GET | `/api/purchase-requests/{id}` | JSON detail with graded severity per item |
+| GET | `/api/purchase-requests/{id}` | JSON detail with **per-item** graded severity (each item compared to its own plan price from "3. Материалы") |
 | POST | `/api/purchase-requests/{id}/decide` | Apply approve / reject / comment from the widget (no token) |
 | GET | `/approval/{id}` | External approval page (token-signed link, opened from Telegram backwards-compat) |
 | GET | `/approval/{id}/state` | Polling endpoint used by approval page |
@@ -287,6 +355,17 @@ curl http://localhost:8000/health
 | POST | `/api/test-digest` | Manually trigger morning digest (for testing) |
 | GET | `/bitrix/install` | Bitrix24 app install page |
 | GET | `/bitrix/widget` | Bitrix24 iframe widget |
+| GET | `/bitrix/rebind` | Re-register LEFT_MENU placement after tunnel URL change |
+
+---
+
+## UI / Visual Design
+
+All HTML surfaces (widget tabs, approval page, install/rebind) share a single Procore-inspired stylesheet defined in `app/_ui_styles.py` (`BASE_CSS` + `FONT_LINKS`). Spec lives in `.stitch/DESIGN.md`.
+
+- **No new runtime deps.** Styles are still inlined into the HTML response — same deploy story (rsync + `systemctl restart buildcontrol`).
+- **Outbound network:** the `<head>` includes a Google Fonts `<link>` for IBM Plex Sans / Mono. If the VPS or the user's browser cannot reach `fonts.googleapis.com`, the CSS falls back to the system font stack (`-apple-system, Segoe UI, Roboto, ...`) — visuals degrade gracefully.
+- **Mobile breakpoint** at 768px collapses the foreman widget tabs to a fixed bottom nav and converts wide tables to stacked cards. Verify after each deploy by opening the widget URL in Chrome DevTools' device toolbar.
 
 ---
 
@@ -393,4 +472,10 @@ For projects imported before that date (which have Bitrix child tasks for subtas
 | Bitrix24 can't reach app | Check tunnel: `ps aux \| grep cloudflared` — if missing, restart it |
 | URL changed | See "⚠️ Known issue" section above |
 | Import fails with 500 | Check logs: `journalctl -u buildcontrol -f` then retry the upload |
+| Import returns 400 immediately on upload | The pre-validation guard rejected the file as not a valid xlsx; re-export from Excel and retry |
 | Port 8000 not listening | `ss -tlnp \| grep 8000` — if empty, app is down |
+| Director Telegram bot silent | (1) `curl https://api.telegram.org/bot<TOKEN>/getWebhookInfo` — check `last_error_message`. (2) `journalctl -u buildcontrol --since '10 min ago'` — common causes: `ModuleNotFoundError: No module named 'openai'` (run `/opt/buildcontrol/venv/bin/pip install -r /opt/buildcontrol/requirements.txt`); chat_id not in `TELEGRAM_DIRECTOR_CHAT_IDS`; `OPENROUTER_API_KEY` missing |
+| Agent answers wrong numbers / "нет данных" unexpectedly | SQLite may be empty or stale — run `scripts/migrate_bitrix_to_sqlite.py`. Also check `py_lower()` is registered: if you see `no such function: py_lower` in logs, the connection was opened without `db.database.get_db()` (e.g. direct aiosqlite call) |
+| Agent shows `qty_consumed` instead of `qty_bought` for "что куплено" questions | Schema docs (`db/schema_docs.py`) didn't emphasize the distinction — verify the ВАЖНО block is present and re-deploy |
+| Cyrillic LIKE returns empty results | SQLite built-in `LOWER()` does NOT handle Cyrillic. Always use `py_lower()` (registered as a custom function). The schema_docs examples all use `py_lower()` — if the agent generates bare `LOWER()` or bare `LIKE` it won't match Russian text |
+| Approve/reject Telegram message buttons stay forever | Bot couldn't `editMessageText` — check `journalctl` for `Telegram editMessageText failed`. Most often the bot lacks edit permission in a group chat; promote it to admin or DM the bot directly |

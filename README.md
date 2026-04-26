@@ -105,27 +105,52 @@ Additionally, `app/webhook_handler.py` handles task progress in two modes:
 
 ### 5. Director Telegram Agent
 
-The director can ask natural-language questions in Russian about any project directly in Telegram.
+The director can ask natural-language questions in Russian about any project directly in Telegram. The agent uses a **text-to-SQL** approach: it has access to the full schema description and generates SQL queries against the local SQLite database.
 
 ```
 Director → Telegram message
   → POST /tg/webhook
     → chat_id checked against TELEGRAM_DIRECTOR_CHAT_IDS allowlist
     → app/telegram_agent.py: OpenRouter (openai/gpt-4.1-mini) tool-use loop
-        → tools call bitrix/project_analytics.py
-            ├─ list_projects            — all active projects
-            ├─ get_schedule_analysis    — tasks classified as done / overdue / in progress / not started
-            ├─ get_budget_overview      — per-phase plan vs actual: Materials / Labor / Equipment
-            ├─ get_resource_costs       — row-level detail for any (etap, zadacha)
-            └─ get_upcoming_tasks       — tasks starting/ending in the next N days
-    → formatted Russian answer → back to Telegram
+        → 2 tools:
+            ├─ list_projects()         — returns [{id, name}] for project name resolution
+            └─ query_database(sql)     — executes any SELECT against SQLite, returns rows as JSON
+        → LLM generates SQL based on SCHEMA_DOCS (db/schema_docs.py) embedded in system prompt
+        → results formatted as Russian answer → back to Telegram
 ```
 
 **Example queries:**
-- «Расскажи про объект Москва Березки» → schedule + budget overview
-- «Что должны были закончить на этой неделе?» → overdue + in-progress tasks
-- «Бюджет по этапу Фундамент» → phase-level breakdown
-- «Какие расходы на топливо?» → resource costs filtered by keyword
+- «Что закупили для ЖК Питер?» → `qty_bought` per material with units
+- «Сколько топлива на складе?» → `qty_stock` for fuel rows
+- «Есть ли перерасход на ЖК Питер?» → phases where `total_actual > total_plan`
+- «Какие задачи просрочены?» → tasks where `date_end_plan < date('now')` and `completion_pct < 100`
+- «Всё нормально на объекте?» → compact status summary (≤5 lines), not a full dump
+
+**Safety**: `query_database` only accepts SELECT statements; non-SELECT returns an error. `LIMIT 200` is appended automatically if absent.
+
+**SQLite custom functions** registered on every connection (see `db/database.py`):
+- `py_lower(text)` — Unicode-aware LOWER that correctly handles Cyrillic (built-in SQLite `LOWER()` only handles ASCII A-Z)
+
+**Schema docs** (`db/schema_docs.py`) embed column semantics into the agent prompt:
+- `qty_bought` = purchased (arrived at warehouse); `qty_consumed` = used on site; `qty_stock` = remaining
+- Phase names have a numeric prefix (`"3. Фундамент"`) — use substring search: `py_lower(phase) LIKE '%фундамент%'`
+- Materials are stored per (phase, task_name) — use `SUM() GROUP BY material_name` for project totals
+
+**QA test suite**: `scripts/test_agent_qa.py` runs the 15 base questions plus, with `--extended`, 9 edge-case questions (missing project, empty phase data, project budget total, phase ranking, etc.). Each tagged question runs a sanity check against the live SQLite DB and the script exits non-zero on any failure. A run log is written to `/tmp/agent_qa_<ts>.log`.
+
+```bash
+# On VPS:
+venv/bin/python3 scripts/test_agent_qa.py             # base 15
+venv/bin/python3 scripts/test_agent_qa.py --extended  # base + edge cases (24)
+```
+
+**Budget aggregation gotcha**: `budget_phases.total_plan` / `total_actual` may be `0` even when the per-component columns (`materials_plan`, `labor_plan`, `equipment_plan`) are populated — the original Bitrix-list keyword match for "итого план" can miss. Always read totals via `COALESCE(NULLIF(total_plan,0), materials_plan+labor_plan+equipment_plan)`. The migration scripts ([scripts/migrate_bitrix_to_sqlite.py](scripts/migrate_bitrix_to_sqlite.py), [scripts/import_excel.py](scripts/import_excel.py)) now apply the same fallback at write time, but pre-existing rows need a one-shot heal:
+
+```sql
+UPDATE budget_phases
+SET total_plan   = COALESCE(NULLIF(total_plan,0),   materials_plan+labor_plan+equipment_plan),
+    total_actual = COALESCE(NULLIF(total_actual,0), materials_actual+labor_actual+equipment_actual);
+```
 
 **Adding write tools** (future): register a new entry in `TOOL_REGISTRY` in `app/telegram_agent.py` with a JSON schema dict and an async handler. The agent loop picks it up automatically.
 
@@ -141,21 +166,37 @@ bitrix/
     lists.py             # Universal Lists CRUD + field resolution helpers
     tasks.py             # CRM task create + UF_ETAP custom field setup
     workgroups.py        # Project (sonet group) creation
-  project_analytics.py   # Read-only analytics: schedule, budget, resources (used by Telegram agent)
+
+db/
+  schema.sql             # CREATE TABLE statements for all 7 tables
+  database.py            # init_db() + get_db() async context manager; registers py_lower()
+  repo.py                # Thin async query helpers (upsert_*, get_*, cascade_update_*)
+  schema_docs.py         # SCHEMA_DOCS string — embedded in Telegram agent system prompt
 
 scripts/
-  import_excel.py        # ExcelImporter class — full import orchestrator (CLI-runnable)
+  import_excel.py        # ExcelImporter class — full import orchestrator; dual-writes to SQLite
+  migrate_bitrix_to_sqlite.py  # One-time backfill: reads all Bitrix lists → populates SQLite
+  test_agent_qa.py       # Runs all 15 QA questions against the live agent (patches Telegram send)
 
 utils/
   excel_parser.py        # Reads .xlsx, detects header rows, returns {sheet: [row_dicts]}
-  cascade.py             # Plan vs actual cascade logic (task + budget level)
+  cascade.py             # Plan vs actual cascade: reads from SQLite, writes back to Bitrix mirror
 
 app/
   webhook_handler.py     # FastAPI app — all HTTP endpoints
   bitrix_app.py          # Bitrix24 iframe install/widget routes + HTML form
-  telegram_agent.py      # Director AI agent: OpenRouter tool-use loop
+  approval_page.py       # External /approval/{id} page + widget approval API
+  _ui_styles.py          # Shared Procore-style design system: BASE_CSS, FONT_LINKS,
+                         # status_pill(), severity_banner() — single source of truth
+                         # consumed by bitrix_app.py and approval_page.py.
+                         # Tokens & components mirror .stitch/DESIGN.md.
+  telegram_agent.py      # Director AI agent: 2-tool text-to-SQL loop (list_projects + query_database)
+  purchase_requests.py   # Procurement approval flow; reads/writes SQLite
 
-config.py                # Settings from .env (BITRIX24_WEBHOOK_URL, BITRIX24_DOMAIN, VPS_URL)
+docs/
+  agent_test_questions.md  # 15 manual QA questions for the director Telegram agent
+
+config.py                # Settings from .env (BITRIX24_WEBHOOK_URL, BITRIX24_DOMAIN, VPS_URL, DB_PATH)
 template_data/           # Excel templates: plan_fact_v3.xlsx (5 sheets) and plan_fact_v4.xlsx (6 sheets + subtasks)
 ```
 
@@ -213,6 +254,7 @@ uvicorn app.webhook_handler:app --reload --port 8000
 | `BITRIX24_WEBHOOK_URL` | Full webhook URL including token |
 | `BITRIX24_DOMAIN` | Portal domain (e.g. `mycompany.bitrix24.ru`) |
 | `VPS_URL` | Public HTTPS URL of this server (Cloudflare tunnel URL) |
+| `DB_PATH` | SQLite database file path (default: `/opt/buildcontrol/buildcontrol.db`) |
 | `LOG_LEVEL` | `INFO` or `DEBUG` |
 
 ---
@@ -246,7 +288,7 @@ See [prod_info.md](prod_info.md) for full ops details, Cloudflare tunnel setup, 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| POST | `/upload` | Upload `.xlsx` → create project + lists + tasks |
+| POST | `/upload` | Upload `.xlsx` → pre-validates with openpyxl (400 on parse error) before scheduling background import |
 | GET | `/api/projects` | List active (non-archived) workgroups |
 | GET | `/api/projects/{id}/tasks` | Root tasks from "2. Этапы и задачи" list (deduplicated; includes `bitrix_task_id`) |
 | GET | `/api/projects/{id}/stages` | Kanban stages for a project (sorted by SORT) |
@@ -258,7 +300,7 @@ See [prod_info.md](prod_info.md) for full ops details, Cloudflare tunnel setup, 
 | POST | `/api/buyer-report` | **Deprecated (410)** — pointer to `/api/purchase-request` |
 | POST | `/api/purchase-request` | Submit a procurement approval request (multipart, REQUIRED `proposal` PDF file, REQUIRED `buyer_comment` if any item priced over plan) |
 | GET | `/api/purchase-requests/pending` | List all pending requests across projects (used by widget Согласование tab) |
-| GET | `/api/purchase-requests/{id}` | JSON detail for one request, with graded severity per item (widget) |
+| GET | `/api/purchase-requests/{id}` | JSON detail for one request, with **per-item** graded severity (each item's price compared to its own plan price from "3. Материалы") |
 | POST | `/api/purchase-requests/{id}/decide` | Apply approve / reject / comment from the widget (no token, trusts Bitrix iframe session) |
 | GET | `/approval/{id}` | External approval page (HMAC token in `?token=`) — kept for Telegram backwards-compat |
 | GET | `/approval/{id}/state` | JSON snapshot of request status + history (used by page polling) |
@@ -271,6 +313,19 @@ See [prod_info.md](prod_info.md) for full ops details, Cloudflare tunnel setup, 
 
 ---
 
+## UI Design System
+
+Every HTML surface (Bitrix24 widget tabs, install/rebind pages, external approval page) is rendered as inline f-strings inside Python — no Jinja, no static-files mount, no CSS framework. Visuals are unified through one shared module:
+
+- **[`.stitch/DESIGN.md`](.stitch/DESIGN.md)** — design tokens, palette, typography, components, mobile breakpoint. Inspired by [Procore](https://www.procore.com).
+- **[`app/_ui_styles.py`](app/_ui_styles.py)** — exports `BASE_CSS` (full stylesheet) and `FONT_LINKS` (IBM Plex Sans / Mono via Google Fonts). Both are concatenated into the `<head>` of every HTML response. Also exports helpers `status_pill(text, variant)` and `severity_banner(...)`.
+
+Key tokens: Procore orange `#F47E42` for primary CTA, neutral grays as canvas, status semantics (success/warn/danger/info) for pills and severity banners. Mobile breakpoint at 768px collapses pill tabs to a fixed bottom nav, turns tables into stacked cards via `.bc-table--responsive`, grows inputs to 44px tap targets, and converts the primary submit into a sticky bottom bar.
+
+**Editing visuals:** change `BASE_CSS` in `app/_ui_styles.py` and update `.stitch/DESIGN.md` in the same commit so the spec stays authoritative.
+
+---
+
 ## Known Limitations
 
 - `RESPONSIBLE_ID` and `CREATED_BY` on created tasks are hardcoded to user `1` (MVP)
@@ -279,6 +334,10 @@ See [prod_info.md](prod_info.md) for full ops details, Cloudflare tunnel setup, 
 - Negative quantities in foreman reports are accepted and cascade through (e.g. `Объём израсходовано` goes negative); no input validation at the API layer
 - `task.commentitem.getlist` returns `[]` via REST even after a successful `task.commentitem.add` — a known Bitrix24 REST API quirk; comments ARE posted (confirmed by the comment ID returned from `add`)
 - Under ≥10 concurrent `/api/report` calls the Bitrix24 rate-limit retry budget (5×) can exhaust, causing HTTP 500. The normal single-foreman form usage is unaffected; multi-site concurrency would require raising `MAX_RETRIES` or queuing
+- Buyer purchase **approval does NOT trigger cascade**. Approval only updates `Объём куплено` / `Остаток` / `Цена ед. факт` — none of which feed `Стоим. факт`. `Стоим. факт` is owned by the foreman daily report path (`Объём израсходовано` × price). Approving a purchase therefore intentionally leaves task/budget rollups unchanged
+- Telegram inline buttons (✅ / ❌) **edit the original message in place** after a decision: the buttons are removed and a status line (e.g. `✅ Подтверждено — @user`) is appended to the message body, so the chat history shows the resolution
+- The Excel importer **skips rows in "2. Этапы и задачи" with empty Этап** — a row with no phase has nowhere to roll into "1. Бюджет" and is treated as junk
+- **SQLite materials are stored per (phase, task_name)** — if the same physical material (e.g. "Топливо") appears in multiple tasks, `SUM(qty_bought)` across rows produces the sum of per-task purchases. The Telegram agent uses `SUM() GROUP BY material_name` for project-wide totals, which is correct; but if two tasks happen to track the same physical stockpile, the numbers will appear doubled. This is a data modelling choice in the Excel template, not a bug.
 
 ## Bitrix UI Root-Only Filter (safe mode)
 
