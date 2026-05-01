@@ -1,5 +1,7 @@
 # BuildControl
 
+> **Work in Progress** — actively developed portfolio project. Core import pipeline and foreman reporting are functional; some features are still being refined.
+
 Construction project management MVP built on top of Bitrix24's REST API. A director uploads an Excel plan → the system creates a Bitrix24 project with structured Universal Lists and CRM tasks → foremen submit daily reports via an embedded iframe widget → fact data rolls up through a cascade to plan/actual comparisons at the task and phase level.
 
 ---
