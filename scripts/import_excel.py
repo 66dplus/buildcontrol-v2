@@ -29,6 +29,70 @@ from utils.excel_parser import parse_excel_file, get_project_name
 logger = logging.getLogger(__name__)
 
 
+def _apply_formula_fallbacks(sheet_name: str, row_data: Dict[str, Any]) -> None:
+    """
+    Compute formula-derived columns that openpyxl returns as None when the Excel file
+    has no cached formula values (e.g. saved from Google Sheets or LibreOffice).
+    Only overwrites columns whose current value is None; Excel-cached values take priority.
+    Uses keyword matching so minor header variations (spaces, commas, ₽) are tolerated.
+    """
+    name_lower = sheet_name.lower()
+    headers = list(row_data.keys())
+
+    def _val(keywords: List[str]) -> Optional[float]:
+        """Return the numeric value of the first column whose header matches all keywords."""
+        for h in headers:
+            h_l = h.lower()
+            if all(kw in h_l for kw in keywords):
+                v = row_data.get(h)
+                if isinstance(v, (int, float)):
+                    return float(v)
+        return None
+
+    def _set_if_none(target_kws: List[str], value: Optional[float]) -> None:
+        """Set the first column matching target_kws to value, only when it is currently None."""
+        if value is None:
+            return
+        for h in headers:
+            h_l = h.lower()
+            if all(kw in h_l for kw in target_kws) and row_data.get(h) is None:
+                row_data[h] = value
+                return
+
+    if "материал" in name_lower:
+        # Стоим. план = Объём план × Цена ед. план
+        qty_plan = _val(["объём", "план"])
+        price_plan = _val(["цена", "план"])
+        _set_if_none(["стоим", "план"], qty_plan * price_plan if qty_plan and price_plan else None)
+        # Стоим. факт = Объём израсходовано × Цена ед. факт
+        qty_consumed = _val(["израсход"])
+        price_actual = _val(["цена", "факт"])
+        _set_if_none(["стоим", "факт"], qty_consumed * price_actual if qty_consumed and price_actual else None)
+
+    elif "трудозатрат" in name_lower:
+        # ФОТ план = Ч-часов план × Ставка
+        hours_plan = _val(["ч-час", "план"])
+        rate = _val(["ставка"])
+        _set_if_none(["фот", "план"], hours_plan * rate if hours_plan and rate else None)
+
+    elif "техник" in name_lower:
+        # Итого план = Часов план × Цена
+        hours_plan = _val(["часов", "план"])
+        price_per_hour = _val(["цена"])
+        _set_if_none(["итого", "план"], hours_plan * price_per_hour if hours_plan and price_per_hour else None)
+
+    elif "бюджет" in name_lower:
+        # Итого план = Материалы план + ФОТ план + Техника план
+        components = [
+            v for v in [
+                _val(["материал", "план"]),
+                _val(["фот", "план"]),
+                _val(["техник", "план"]),
+            ] if v is not None
+        ]
+        _set_if_none(["итого", "план"], sum(components) if components else None)
+
+
 def _deduplicate_labor_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Deduplicate трудозатраты rows by (Этап, Задача, Специальность/*бригада*).
@@ -302,6 +366,9 @@ class ExcelImporter:
                     if is_zadach_sheet and not etap_val.strip():
                         logger.debug(f"Skipping row {row_idx} in {sheet_name}: empty Этап")
                         continue
+
+                    # Fill formula-derived columns that Excel may not have cached
+                    _apply_formula_fallbacks(sheet_name, row_data)
 
                     # Map header -> field_id -> value
                     field_values = {

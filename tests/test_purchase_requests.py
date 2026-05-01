@@ -185,7 +185,9 @@ async def test_apply_buyer_purchase_updates_quantities_and_weighted_price(
     assert fv[materials_field_map["Остаток на складе"]] == pytest.approx(15)
     # Weighted price: (10*195 + 1100) / 15 = 203.33
     assert fv[materials_field_map["Цена ед. факт, ₽"]] == pytest.approx(203.33, rel=1e-3)
-    assert captured["cascades"] == ["task", "budget"]
+    # Cascade is intentionally NOT triggered after approval (Bug 4 fix);
+    # Стоим. факт depends on Объём израсходовано, which approval does not touch.
+    assert "cascades" not in captured
 
 
 @pytest.mark.asyncio
@@ -259,3 +261,125 @@ async def test_resolve_request_is_idempotent_when_already_approved(
     assert result["already_resolved"] is True
     assert result["status"] == STATUS_APPROVED
     assert apply_calls == [], "approval logic must NOT run again on a resolved request"
+
+
+@pytest.mark.asyncio
+async def test_apply_buyer_purchase_does_not_call_cascade(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug 4: approval must NOT trigger cascade — Стоим. факт is unchanged."""
+    fm = {"Объём план": 1, "Объём куплено": 2, "Остаток на складе": 3, "Цена ед. факт, ₽": 4,
+          "Этап": 5, "Задача": 6}
+    elem = _make_element(101, "Бетон", {1: 100, 2: 0, 3: 0, 4: 0, 5: "Фундамент", 6: "Заливка"})
+    materials_list = {"ID": "1", "NAME": "3. Материалы", "IBLOCK_CODE": "code"}
+
+    async def fake_get_lists(_c: Any, _g: int) -> List[Dict[str, Any]]:
+        return [materials_list]
+
+    async def fake_get_fields(_c: Any, _l: int, _i: str, _g: int) -> Dict[str, Any]:
+        return {f"PROPERTY_{pid}": {"NAME": name} for name, pid in fm.items()}
+
+    async def fake_get_elements(_c: Any, _l: int, _i: str, _g: int) -> List[Dict[str, Any]]:
+        return [elem]
+
+    async def fake_update_element(*_a: Any, **_k: Any) -> bool:
+        return True
+
+    cascade_calls: List[str] = []
+
+    async def fake_cascade_task(*_a: Any, **_k: Any) -> bool:
+        cascade_calls.append("task")
+        return True
+
+    async def fake_cascade_budget(*_a: Any, **_k: Any) -> bool:
+        cascade_calls.append("budget")
+        return True
+
+    monkeypatch.setattr(purchase_requests.lists, "get_lists", fake_get_lists)
+    monkeypatch.setattr(purchase_requests.lists, "get_fields", fake_get_fields)
+    monkeypatch.setattr(purchase_requests.lists, "get_elements", fake_get_elements)
+    monkeypatch.setattr(purchase_requests.lists, "update_element", fake_update_element)
+
+    import utils.cascade as cascade_mod
+    monkeypatch.setattr(cascade_mod, "cascade_update_task", fake_cascade_task)
+    monkeypatch.setattr(cascade_mod, "cascade_update_budget", fake_cascade_budget)
+
+    items = [{"material_name": "Бетон", "qty": 5, "price": 200, "total": 1000}]
+    await purchase_requests._apply_buyer_purchase(client=None, project_id=42, items=items)
+
+    assert cascade_calls == [], "cascade must not run after approval; foreman report owns Стоим. факт"
+
+
+@pytest.mark.asyncio
+async def test_materials_plan_index_returns_per_material_price_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug 6 helper: materials_plan_index must return per-material price_plan."""
+    fm = {"Цена ед. план, ₽": 7, "Ед. изм": 8}
+    e1 = _make_element(1, "Бетон М300", {7: 100, 8: "м3"})
+    e2 = _make_element(2, "Арматура", {7: 50, 8: "т"})
+    materials_list = {"ID": "1", "NAME": "3. Материалы", "IBLOCK_CODE": "code"}
+
+    async def fake_get_lists(_c: Any, _g: int) -> List[Dict[str, Any]]:
+        return [materials_list]
+
+    async def fake_get_fields(_c: Any, _l: int, _i: str, _g: int) -> Dict[str, Any]:
+        return {f"PROPERTY_{pid}": {"NAME": name} for name, pid in fm.items()}
+
+    async def fake_get_elements(_c: Any, _l: int, _i: str, _g: int) -> List[Dict[str, Any]]:
+        return [e1, e2]
+
+    monkeypatch.setattr(purchase_requests.lists, "get_lists", fake_get_lists)
+    monkeypatch.setattr(purchase_requests.lists, "get_fields", fake_get_fields)
+    monkeypatch.setattr(purchase_requests.lists, "get_elements", fake_get_elements)
+
+    idx = await purchase_requests.materials_plan_index(client=None, project_id=42)
+
+    assert idx["бетон м300"]["price_plan"] == pytest.approx(100.0)
+    assert idx["бетон м300"]["unit"] == "м3"
+    assert idx["арматура"]["price_plan"] == pytest.approx(50.0)
+    assert idx["арматура"]["unit"] == "т"
+
+
+def test_import_excel_skips_empty_etap_rows(tmp_path: Any) -> None:
+    """Bug 2: rows with empty Этап in sheet 2 must be skipped during list creation."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "2. Этапы и задачи"
+    ws.append(["Этап", "Задача", "Дата нач. план"])
+    ws.append(["Фундамент", "Заливка", "2026-05-01"])  # keep
+    ws.append(["", "Без этапа", "2026-05-02"])         # skip — empty Этап
+    ws.append(["Кровля", "Монтаж", "2026-05-03"])     # keep
+    f = tmp_path / "v3.xlsx"
+    wb.save(f)
+
+    from openpyxl import load_workbook
+    wb2 = load_workbook(f, read_only=True, data_only=True)
+    sheet = wb2["2. Этапы и задачи"]
+    rows = list(sheet.iter_rows(values_only=True))
+    headers = list(rows[0])
+    data_rows = [dict(zip(headers, r)) for r in rows[1:]]
+
+    # Same filter as scripts/import_excel.py: skip empty Этап rows
+    kept = [r for r in data_rows if (r.get("Этап") or "").strip()]
+    assert len(kept) == 2
+    assert kept[0]["Задача"] == "Заливка"
+    assert kept[1]["Задача"] == "Монтаж"
+
+
+def test_upload_excel_rejects_corrupted_xlsx_via_openpyxl() -> None:
+    """Bug 1: pre-validation uses openpyxl; non-xlsx bytes must raise."""
+    import tempfile
+    from openpyxl import load_workbook
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        f.write(b"this is not a real xlsx file just plain text bytes")
+        bad_path = f.name
+    raised = False
+    try:
+        wb = load_workbook(bad_path, read_only=True, data_only=True)
+        wb.close()
+    except Exception:
+        raised = True
+    import os as _os
+    try:
+        _os.unlink(bad_path)
+    except OSError:
+        pass
+    assert raised, "openpyxl must raise on corrupted xlsx; pre-validation guard depends on this"

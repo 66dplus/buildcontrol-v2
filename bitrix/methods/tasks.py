@@ -110,6 +110,69 @@ async def get_task_stages(client: BitrixClient, group_id: int) -> list[dict]:
     return sorted(stages, key=lambda s: int(s.get("SORT", 0)))
 
 
+_STAGE_SYSTEM_TYPE_RU: Dict[str, str] = {
+    "NEW": "Новая",
+    "PROGRESS": "В процессе",
+    "WORK": "В работе",
+    "REVIEW": "На проверке",
+    "FINISH": "Завершена",
+}
+
+
+def stage_display_name(stages: list[dict], stage_id: Any) -> Optional[str]:
+    """
+    Map a kanban stage_id to its Russian display name.
+
+    Mirrors api_stages() / _resolve_stage_system_type() position fallback:
+    Bitrix returns SYSTEM_TYPE = null for custom stages, so for stages without
+    a SYSTEM_TYPE we use position — first = «Новая», last = «Завершена»,
+    middle = stage's TITLE (or «В работе» if blank).
+    """
+    if stage_id in (None, "", 0):
+        return None
+    sid = str(stage_id)
+    for index, stage in enumerate(stages):
+        if str(stage.get("ID", "")) != sid:
+            continue
+        sys_type = stage.get("SYSTEM_TYPE") or None
+        if sys_type and sys_type in _STAGE_SYSTEM_TYPE_RU:
+            return _STAGE_SYSTEM_TYPE_RU[sys_type]
+        if index == 0:
+            return "Новая"
+        if index == len(stages) - 1:
+            return "Завершена"
+        return (stage.get("TITLE") or "").strip() or "В работе"
+    return None
+
+
+async def list_task_stage_ids(client: BitrixClient, group_id: int) -> Dict[str, str]:
+    """
+    Return {bitrix_task_id: kanban_stage_id} for every task in the workgroup.
+
+    Uses tasks.task.list with a STAGE_ID select; pages through results 50 at a time.
+    """
+    out: Dict[str, str] = {}
+    start = 0
+    while True:
+        resp = await client.call("tasks.task.list", {
+            "filter": {"GROUP_ID": group_id},
+            "select": ["ID", "STAGE_ID"],
+            "start": start,
+        })
+        result = resp.get("result", {}) or {}
+        tasks_list = result.get("tasks", []) or []
+        for t in tasks_list:
+            tid = str(t.get("id") or t.get("ID") or "").strip()
+            sid = str(t.get("stageId") or t.get("STAGE_ID") or "").strip()
+            if tid:
+                out[tid] = sid
+        next_start = resp.get("next")
+        if next_start is None or not tasks_list:
+            break
+        start = int(next_start)
+    return out
+
+
 async def move_task_to_stage(client: BitrixClient, task_id: int, stage_id: int) -> bool:
     """Move a CRM task to the specified kanban stage."""
     resp = await client.call("task.stages.movetask", {"id": task_id, "stageId": stage_id})

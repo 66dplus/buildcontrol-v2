@@ -54,6 +54,9 @@ class Settings:
             int(x.strip()) for x in _director_ids.split(",") if x.strip().isdigit()
         }
 
+        # SQLite database path
+        self.db_path: str = os.getenv("DB_PATH", "/opt/buildcontrol/buildcontrol.db")
+
     def validate(self) -> None:
         """Validate that all required settings are configured."""
         if not self.bitrix24_webhook_url:

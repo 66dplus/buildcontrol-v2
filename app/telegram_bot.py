@@ -25,7 +25,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from bitrix.client import BitrixClient
-from app.notifications.telegram import answer_callback_query, send_telegram
+from app.notifications.telegram import answer_callback_query, edit_message_text, send_telegram
 from app.purchase_requests import (
     DECISION_APPROVE,
     DECISION_COMMENT,
@@ -86,8 +86,11 @@ async def _handle_callback(callback: Dict[str, Any]) -> None:
     cb_id = callback.get("id")
     data = callback.get("data") or ""
     user = callback.get("from") or {}
-    chat = (callback.get("message") or {}).get("chat") or {}
+    src_message = callback.get("message") or {}
+    chat = src_message.get("chat") or {}
     chat_id = chat.get("id")
+    message_id = src_message.get("message_id")
+    original_text = src_message.get("text") or src_message.get("caption") or ""
     actor = _user_label(user)
 
     if not data.startswith("pr:"):
@@ -151,6 +154,20 @@ async def _handle_callback(callback: Dict[str, Any]) -> None:
         else:
             tag = "✅ Подтверждено" if decision == DECISION_APPROVE else "❌ Отклонено"
             await answer_callback_query(cb_id, tag)
+
+    # Edit the original Telegram message in place so the buttons disappear and
+    # the resolution is visible in the chat history (TEST_PLAN 9.1/9.2).
+    if not result.get("already_resolved") and chat_id is not None and message_id:
+        status_label = result.get("status") or (
+            "Подтверждено" if decision == DECISION_APPROVE else "Отклонено"
+        )
+        emoji = "✅" if decision == DECISION_APPROVE else "❌"
+        suffix = f"\n\n{emoji} <b>{status_label}</b> — {actor}"
+        new_text = (original_text or f"Заявка №{request_id}") + suffix
+        try:
+            await edit_message_text(chat_id, message_id, new_text)
+        except Exception as e:
+            logger.warning(f"Telegram edit after resolve failed: {e}")
 
 
 async def _handle_message(message: Dict[str, Any]) -> None:

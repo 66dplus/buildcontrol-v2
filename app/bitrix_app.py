@@ -14,6 +14,7 @@ import httpx
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 
+from app._ui_styles import BASE_CSS, FONT_LINKS
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -138,8 +139,14 @@ async def rebind_placement(domain: str = "", auth: str = "") -> HTMLResponse:
     """
     if not domain or not auth:
         return HTMLResponse(
-            "<h2>Ошибка</h2><p>Укажите параметры: <code>?domain=YOUR_DOMAIN&amp;auth=AUTH_TOKEN</code></p>"
-            "<p>Пример: <code>/bitrix/rebind?domain=mycompany.bitrix24.ru&amp;auth=abc123</code></p>",
+            _rebind_page(
+                variant="warn",
+                title="Не хватает параметров",
+                body=(
+                    "Укажите: <code>?domain=YOUR_DOMAIN&amp;auth=AUTH_TOKEN</code><br>"
+                    "Пример: <code>/bitrix/rebind?domain=mycompany.bitrix24.ru&amp;auth=abc123</code>"
+                ),
+            ),
             status_code=400,
         )
 
@@ -165,21 +172,28 @@ async def rebind_placement(domain: str = "", auth: str = "") -> HTMLResponse:
         logger.info(f"rebind_placement: domain={domain} result={result}")
         ok = result.get("result") is True or result.get("result") == 1
         if ok:
-            return HTMLResponse(
-                f"<h2 style='color:green'>✓ Готово</h2>"
-                f"<p>Виджет <strong>BuildControl</strong> успешно привязан к левой панели.<br>"
-                f"Handler: <code>{vps_url}/bitrix/widget</code></p>"
-            )
+            return HTMLResponse(_rebind_page(
+                variant="success",
+                title="Готово",
+                body=(
+                    f"Виджет <strong>BuildControl</strong> успешно привязан к левой панели.<br>"
+                    f"Handler: <code>{vps_url}/bitrix/widget</code>"
+                ),
+            ))
         else:
             detail = result.get("error_description") or result.get("error") or str(result)
-            return HTMLResponse(
-                f"<h2 style='color:orange'>⚠ Ответ Bitrix24</h2><p>{detail}</p>"
-                f"<p>Если ошибка «already binded» — виджет уже зарегистрирован с этим handler-ом.</p>"
-            )
+            return HTMLResponse(_rebind_page(
+                variant="warn",
+                title="Ответ Bitrix24",
+                body=(
+                    f"{detail}<br>"
+                    f"Если ошибка «already binded» — виджет уже зарегистрирован с этим handler-ом."
+                ),
+            ))
     except Exception as e:
         logger.error(f"rebind_placement failed: {e}", exc_info=True)
         return HTMLResponse(
-            f"<h2 style='color:red'>Ошибка</h2><p>{e}</p>",
+            _rebind_page(variant="danger", title="Ошибка", body=str(e)),
             status_code=500,
         )
 
@@ -187,6 +201,31 @@ async def rebind_placement(domain: str = "", auth: str = "") -> HTMLResponse:
 # ---------------------------------------------------------------------------
 # HTML templates
 # ---------------------------------------------------------------------------
+
+def _rebind_page(*, variant: str, title: str, body: str) -> str:
+    """Lightweight standalone status page for the /bitrix/rebind handler."""
+    icon = {"success": "✓", "warn": "⚠", "danger": "✗"}.get(variant, "ⓘ")
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BuildControl — Bitrix24 placement</title>
+{FONT_LINKS}
+{BASE_CSS}
+</head>
+<body>
+<div class="bc-page bc-stack">
+  <h1>BuildControl · Bitrix24</h1>
+  <div class="bc-banner bc-banner--{variant}">
+    <span class="bc-banner__icon">{icon}</span>
+    <div class="bc-banner__title">{title}</div>
+    <div>{body}</div>
+  </div>
+</div>
+</body>
+</html>"""
+
 
 def _install_page(success: bool, error: str = "") -> str:
     """Install page: on success shows installFinish JS + upload form."""
@@ -248,23 +287,18 @@ function switchTab(tabId) {{
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Импорт Excel — Ошибка установки</title>
+{FONT_LINKS}
+{BASE_CSS}
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-         background: #f5f7fa; display: flex; align-items: center;
-         justify-content: center; min-height: 100vh; }}
-  .card {{ background: #fff; border-radius: 12px; padding: 40px; text-align: center;
-           box-shadow: 0 2px 16px rgba(0,0,0,0.08); max-width: 400px; width: 90%; }}
-  .card .icon {{ color: #e74c3c; font-size: 48px; margin-bottom: 16px; }}
-  h2 {{ color: #2c3e50; margin-bottom: 12px; }}
-  p {{ color: #555; line-height: 1.5; }}
+  body {{ display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
+  .install-error {{ max-width: 440px; width: 100%; padding: 32px; text-align: center; }}
 </style>
 </head>
 <body>
-<div class="card">
-  <div class="icon">✗</div>
-  <h2>Ошибка установки</h2>
-  <p>{error}</p>
+<div class="bc-card install-error">
+  <div class="bc-banner__icon" style="font-size:40px;color:var(--bc-danger);margin-bottom:8px;">✗</div>
+  <h2 style="margin-bottom:8px;">Ошибка установки</h2>
+  <p style="color:var(--bc-ink-muted);">{error}</p>
 </div>
 </body>
 </html>"""
@@ -318,320 +352,12 @@ function switchTab(tabId) {{
 
 
 def _common_styles() -> str:
-    """Shared CSS for install and widget pages."""
-    return """<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #f5f7fa;
-    padding: 24px;
-    color: #2c3e50;
-  }
-  h1 { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
-  .subtitle { color: #7f8c8d; font-size: 13px; margin-bottom: 24px; }
+    """Shared CSS + font links for install and widget pages.
 
-  /* Tab navigation */
-  .tab-bar {
-    display: flex;
-    gap: 0;
-    margin-bottom: 20px;
-    border-bottom: 2px solid #e0e4e8;
-  }
-  .tab-btn {
-    padding: 10px 20px;
-    border: none;
-    background: none;
-    font-size: 14px;
-    font-weight: 500;
-    color: #7f8c8d;
-    cursor: pointer;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -2px;
-    transition: all .2s;
-  }
-  .tab-btn:hover { color: #2c3e50; }
-  .tab-btn.active {
-    color: #2980b9;
-    border-bottom-color: #2980b9;
-  }
-  .tab-content { display: none; }
-
-  /* Report form styles */
-  .form-group { margin-bottom: 18px; }
-  .form-group label {
-    display: block;
-    font-size: 13px;
-    font-weight: 500;
-    color: #555;
-    margin-bottom: 6px;
-  }
-  .form-group select,
-  .form-group input[type="date"],
-  .form-group input[type="number"],
-  .form-group input[type="text"],
-  .form-group textarea {
-    width: 100%;
-    padding: 9px 12px;
-    border: 1px solid #d5d8dc;
-    border-radius: 6px;
-    font-size: 14px;
-    font-family: inherit;
-    background: #fff;
-  }
-  .form-group textarea { resize: vertical; min-height: 60px; }
-
-  .section-title {
-    font-size: 15px;
-    font-weight: 600;
-    color: #2c3e50;
-    margin: 20px 0 10px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid #e0e4e8;
-  }
-
-  .dynamic-row {
-    display: flex;
-    gap: 8px;
-    align-items: flex-end;
-    margin-bottom: 8px;
-    background: #fff;
-    padding: 10px;
-    border-radius: 8px;
-    border: 1px solid #e8eaed;
-  }
-  .dynamic-row .field { flex: 1; }
-  .dynamic-row .field-sm { flex: 0 0 80px; }
-  .dynamic-row .field-unit { flex: 0 0 60px; font-size: 13px; color: #7f8c8d; padding-bottom: 10px; }
-  .dynamic-row .field label { font-size: 12px; color: #888; margin-bottom: 4px; }
-  .dynamic-row .field select,
-  .dynamic-row .field input {
-    width: 100%;
-    padding: 7px 8px;
-    border: 1px solid #d5d8dc;
-    border-radius: 5px;
-    font-size: 13px;
-  }
-  .dynamic-row .remove-btn {
-    flex: 0 0 32px;
-    height: 32px;
-    border: none;
-    background: #fdedec;
-    color: #c0392b;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 16px;
-    margin-bottom: 0;
-  }
-  .dynamic-row .remove-btn:hover { background: #f5b7b1; }
-
-  .add-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 8px 14px;
-    border: 1px dashed #bdc3c7;
-    border-radius: 6px;
-    background: none;
-    color: #2980b9;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    margin-top: 4px;
-  }
-  .add-btn:hover { border-color: #2980b9; background: #eaf4fb; }
-
-  button#submitReport,
-  button#submitBuyerReport {
-    width: 100%;
-    padding: 12px;
-    background: #27ae60;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    font-size: 15px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background .2s;
-    margin-top: 16px;
-  }
-  button#submitReport:hover:not(:disabled),
-  button#submitBuyerReport:hover:not(:disabled) { background: #219a52; }
-  button#submitReport:disabled,
-  button#submitBuyerReport:disabled { background: #a9dfbf; cursor: not-allowed; }
-
-  #reportResult,
-  #buyerResult {
-    display: none;
-    margin-top: 16px;
-    background: #eafaf1;
-    border: 1px solid #a9dfbf;
-    border-radius: 8px;
-    padding: 14px;
-  }
-  #reportResult h3, #buyerResult h3 { font-size: 15px; color: #27ae60; margin-bottom: 6px; }
-  #reportResult p, #buyerResult p { font-size: 13px; color: #555; }
-
-  #reportError,
-  #buyerError {
-    display: none;
-    margin-top: 16px;
-    background: #fdedec;
-    border: 1px solid #f5b7b1;
-    border-radius: 8px;
-    padding: 14px;
-    color: #c0392b;
-    font-size: 13px;
-  }
-
-  .upload-zone {
-    border: 2px dashed #bdc3c7;
-    border-radius: 10px;
-    padding: 32px 24px;
-    text-align: center;
-    cursor: pointer;
-    transition: border-color .2s, background .2s;
-    background: #fff;
-    margin-bottom: 16px;
-  }
-  .upload-zone:hover, .upload-zone.drag { border-color: #3498db; background: #eaf4fb; }
-  .upload-zone .icon { font-size: 36px; margin-bottom: 10px; }
-  .upload-zone p { color: #7f8c8d; font-size: 14px; }
-  .upload-zone .filename { color: #2980b9; font-weight: 500; font-size: 14px; margin-top: 8px; }
-
-  input[type=file] { display: none; }
-
-  /* Multi-task report blocks */
-  .task-block {
-    border: 1px solid #d5d8dc;
-    border-radius: 10px;
-    padding: 14px 16px;
-    margin-bottom: 16px;
-    background: #f8f9fa;
-    position: relative;
-  }
-  .task-block-header {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 12px;
-  }
-  .task-block-header label { font-size: 13px; font-weight: 600; color: #2c3e50; white-space: nowrap; }
-  .task-block-header select { flex: 1; padding: 8px 10px; border: 1px solid #d5d8dc; border-radius: 6px; font-size: 13px; }
-  .task-block-remove {
-    flex: 0 0 32px; height: 32px; border: none; background: #fdedec;
-    color: #c0392b; border-radius: 6px; cursor: pointer; font-size: 16px;
-  }
-  .task-block-remove:hover { background: #f5b7b1; }
-  .task-block .section-title { font-size: 13px; margin: 14px 0 8px; }
-  .add-task-btn {
-    display: block; width: 100%; padding: 10px;
-    border: 2px dashed #bdc3c7; border-radius: 8px;
-    background: none; color: #2980b9; font-size: 13px;
-    font-weight: 600; cursor: pointer; margin-bottom: 16px;
-  }
-  .add-task-btn:hover { border-color: #2980b9; background: #eaf4fb; }
-
-  button#importBtn {
-    width: 100%;
-    padding: 12px;
-    background: #2980b9;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    font-size: 15px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background .2s;
-  }
-  button#importBtn:hover:not(:disabled) { background: #1a6fa0; }
-  button#importBtn:disabled { background: #a0c4dd; cursor: not-allowed; }
-
-  #progress {
-    display: none;
-    margin-top: 16px;
-  }
-  #progress .progress-title {
-    font-size: 13px;
-    color: #7f8c8d;
-    margin-bottom: 10px;
-    text-align: center;
-  }
-  .step {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 7px 10px;
-    margin: 3px 0;
-    border-radius: 6px;
-    font-size: 14px;
-    color: #bdc3c7;
-    transition: all .3s;
-  }
-  .step.active {
-    color: #2980b9;
-    background: #eaf4fb;
-    font-weight: 500;
-  }
-  .step.done { color: #27ae60; }
-  .step-dot {
-    width: 18px; height: 18px;
-    border-radius: 50%;
-    background: #ecf0f1;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 11px;
-    flex-shrink: 0;
-    transition: all .3s;
-  }
-  .step.active .step-dot {
-    border: 2px solid #2980b9;
-    border-top-color: transparent;
-    background: transparent;
-    animation: spin .8s linear infinite;
-  }
-  .step.done .step-dot {
-    background: #27ae60;
-    color: #fff;
-    font-size: 12px;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  #result {
-    display: none;
-    margin-top: 20px;
-    background: #eafaf1;
-    border: 1px solid #a9dfbf;
-    border-radius: 8px;
-    padding: 16px;
-  }
-  #result h3 { font-size: 15px; color: #27ae60; margin-bottom: 10px; }
-  #result .stat { font-size: 13px; color: #555; margin: 4px 0; }
-  #result .links { margin-top: 12px; }
-  #result .links a {
-    display: inline-block;
-    margin: 4px 6px 4px 0;
-    padding: 6px 14px;
-    background: #2980b9;
-    color: #fff;
-    border-radius: 6px;
-    text-decoration: none;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-  }
-  #result .links a:hover { background: #1a6fa0; }
-
-  #error {
-    display: none;
-    margin-top: 20px;
-    background: #fdedec;
-    border: 1px solid #f5b7b1;
-    border-radius: 8px;
-    padding: 14px;
-    color: #c0392b;
-    font-size: 13px;
-  }
-  #error strong { display: block; margin-bottom: 4px; font-size: 14px; }
-</style>"""
+    Visual tokens, components, and the mobile breakpoint live in
+    ``app/_ui_styles.py`` so every HTML surface stays in lockstep.
+    """
+    return FONT_LINKS + BASE_CSS
 
 
 def _tab_bar_html() -> str:
@@ -1351,7 +1077,11 @@ def _buyer_report_form_html() -> str:
 
 <div class="form-group">
   <label>Счёт или коммерческое предложение (PDF, до {max_mb} МБ) <span style="color:#c0392b;">*</span></label>
-  <input type="file" id="buyerProposal" accept=".pdf" required onchange="updateBuyerCommentState()">
+  <div class="file-pick-zone" id="proposalZone" onclick="document.getElementById('buyerProposal').click()">
+    <span class="fpz-icon">📎</span>
+    <span class="fpz-name" id="proposalLabel">Нажмите для выбора PDF-файла</span>
+    <input type="file" id="buyerProposal" accept=".pdf" required onchange="onProposalSelect(this)">
+  </div>
 </div>
 
 <button id="submitBuyerReport" onclick="submitBuyerReport()" disabled>Отправить заявку на согласование</button>
@@ -1468,18 +1198,29 @@ function onBuyerQtyInput(input) {{
   const plan = parseFloat(opt.dataset.plan);
   const bought = parseFloat(opt.dataset.bought) || 0;
   const qty = parseFloat(input.value) || 0;
+  input.style.borderColor = '';
   if (!isNaN(plan) && plan > 0) {{
-    const newTotal = bought + qty;
-    if (newTotal > plan) {{
-      const over = (newTotal - plan).toFixed(2);
-      input.style.borderColor = '#e74c3c';
-      hint.textContent = `⚠ Вы хотите купить на ${{over}} ед. больше плана. Обратитесь к менеджеру.`;
-      hint.style.color = '#e74c3c';
+    const remaining = Math.max(0, plan - bought);
+    if (qty === 0) {{
+      // No amount entered — show static state
+      if (bought >= plan) {{
+        hint.textContent = '✅ План по закупкам выполнен';
+        hint.style.color = 'var(--bc-success, #1F8A4C)';
+      }} else {{
+        hint.textContent = `Осталось купить по плану: ${{remaining.toFixed(2)}}`;
+        hint.style.color = '#7f8c8d';
+      }}
     }} else {{
-      input.style.borderColor = '';
-      const remaining = Math.max(0, plan - bought);
-      hint.textContent = `Осталось купить по плану: ${{remaining.toFixed(2)}}`;
-      hint.style.color = '#7f8c8d';
+      const newTotal = bought + qty;
+      if (newTotal > plan) {{
+        const over = (newTotal - plan).toFixed(2);
+        input.style.borderColor = '#e74c3c';
+        hint.textContent = `⚠ Вы хотите купить на ${{over}} ед. больше плана. Обратитесь к менеджеру.`;
+        hint.style.color = '#e74c3c';
+      }} else {{
+        hint.textContent = `Осталось купить по плану: ${{remaining.toFixed(2)}}`;
+        hint.style.color = '#7f8c8d';
+      }}
     }}
   }}
 }}
@@ -1513,12 +1254,12 @@ function _collectBuyerItems() {{
         priceHint.style.color = '#c0392b';
         if (costInput) costInput.style.borderColor = '#e74c3c';
       }} else {{
-        priceHint.textContent = `План: ${{pricePlan.toFixed(2)}} ₽`;
+        priceHint.textContent = `По плану: ${{(qty * pricePlan).toFixed(2)}} ₽`;
         priceHint.style.color = '#7f8c8d';
         if (costInput) costInput.style.borderColor = '';
       }}
     }} else if (priceHint && pricePlan > 0) {{
-      priceHint.textContent = `План: ${{pricePlan.toFixed(2)}} ₽`;
+      priceHint.textContent = `Цена по плану: ${{pricePlan.toFixed(2)}} ₽/ед.`;
       priceHint.style.color = '#7f8c8d';
       if (costInput) costInput.style.borderColor = '';
     }} else if (priceHint) {{
@@ -1551,6 +1292,19 @@ function updateBuyerCommentState() {{
     commentEl.style.borderColor = '';
     hintEl.textContent = '';
   }}
+}}
+
+function onProposalSelect(input) {{
+  const zone = document.getElementById('proposalZone');
+  const label = document.getElementById('proposalLabel');
+  if (input.files && input.files[0]) {{
+    label.textContent = input.files[0].name;
+    zone.classList.add('has-file');
+  }} else {{
+    label.textContent = 'Нажмите для выбора PDF-файла';
+    zone.classList.remove('has-file');
+  }}
+  updateBuyerCommentState();
 }}
 
 async function submitBuyerReport() {{
@@ -1642,42 +1396,56 @@ def _approval_tab_html() -> str:
 
 <style>
   .pr-card {{
-    background: #fff; border: 1px solid #e0e4e8; border-radius: 10px;
+    background: var(--bc-surface);
+    border: 1px solid var(--bc-border);
+    border-left: 4px solid var(--bc-warning);
+    border-radius: var(--bc-radius-card);
     padding: 12px 14px; margin-bottom: 10px; cursor: pointer;
-    transition: border-color .15s, box-shadow .15s;
+    transition: border-color 150ms ease, box-shadow 200ms ease;
   }}
-  .pr-card:hover {{ border-color: #2980b9; box-shadow: 0 2px 8px rgba(41,128,185,.08); }}
+  .pr-card:hover {{ border-color: var(--bc-primary); box-shadow: var(--bc-shadow-1); }}
   .pr-card .pr-row {{ display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }}
-  .pr-card .pr-num {{ font-weight: 600; color: #2c3e50; }}
-  .pr-card .pr-proj {{ color: #7f8c8d; font-size: 13px; }}
-  .pr-card .pr-mat {{ font-size: 13px; color: #34495e; margin-top: 4px; }}
-  .pr-card .pr-total {{ font-weight: 600; color: #27ae60; }}
+  .pr-card .pr-num {{ font-weight: 600; color: var(--bc-ink); }}
+  .pr-card .pr-proj {{ color: var(--bc-ink-muted); font-size: 13px; }}
+  .pr-card .pr-mat {{ font-size: 13px; color: var(--bc-ink); margin-top: 4px; }}
+  .pr-card .pr-total {{ font-weight: 600; color: var(--bc-success); }}
 
-  .pr-detail {{ background: #fff; border: 1px solid #e0e4e8; border-radius: 10px; padding: 16px; margin-top: 14px; }}
+  .pr-detail {{
+    background: var(--bc-surface);
+    border: 1px solid var(--bc-border);
+    border-radius: var(--bc-radius-card);
+    padding: 16px; margin-top: 14px;
+  }}
   .pr-detail h2 {{ font-size: 16px; margin: 0 0 8px 0; }}
   .pr-detail table {{ width: 100%; border-collapse: collapse; font-size: 13px; margin: 8px 0; }}
-  .pr-detail th, .pr-detail td {{ padding: 6px 8px; text-align: left; border-bottom: 1px solid #ecf0f1; }}
-  .pr-detail th {{ background: #f8f9fa; font-weight: 500; }}
+  .pr-detail th, .pr-detail td {{ padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--bc-border); }}
+  .pr-detail th {{ background: var(--bc-surface-alt); font-weight: 500; color: var(--bc-ink-muted); }}
   .pr-banner {{
-    padding: 10px 12px; border-radius: 6px; margin: 10px 0;
-    font-size: 13px; line-height: 1.5; border-left: 4px solid #bdc3c7;
+    padding: 10px 12px; border-radius: var(--bc-radius-input); margin: 10px 0;
+    font-size: 13px; line-height: 1.5; border-left: 4px solid var(--bc-border-strong);
   }}
-  .pr-banner.ok {{ background: #eafaf1; border-color: #a9dfbf; }}
-  .pr-banner.low {{ background: #fef9e7; border-color: #f7dc6f; }}
-  .pr-banner.medium {{ background: #fef5e7; border-color: #f5b041; }}
-  .pr-banner.high {{ background: #fdedec; border-color: #e74c3c; }}
-  .pr-banner.critical {{ background: #fadbd8; border-color: #922b21; }}
+  .pr-banner.ok       {{ background: var(--bc-success-soft); border-color: var(--bc-success); }}
+  .pr-banner.low      {{ background: var(--bc-warning-soft); border-color: var(--bc-warning); }}
+  .pr-banner.medium   {{ background: var(--bc-warning-soft); border-color: var(--bc-warning); }}
+  .pr-banner.high     {{ background: var(--bc-danger-soft);  border-color: var(--bc-danger); }}
+  .pr-banner.critical {{ background: var(--bc-danger-soft);  border-color: var(--bc-danger); }}
   .pr-banner .pr-banner-emoji {{ font-size: 18px; }}
   .pr-banner .pr-banner-header {{ font-weight: 700; font-size: 14px; margin: 4px 0; }}
 
   .pr-actions {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }}
-  .pr-actions button {{ flex: 1; min-width: 120px; padding: 10px; color: #fff; border: 0; border-radius: 6px; font-size: 14px; cursor: pointer; }}
-  .pr-btn-approve {{ background: #27ae60; }}
-  .pr-btn-reject  {{ background: #c0392b; }}
-  .pr-btn-comment {{ background: #7f8c8d; }}
+  .pr-actions button {{
+    flex: 1; min-width: 120px; padding: 10px; color: #fff;
+    border: 0; border-radius: var(--bc-radius-input); font-size: 14px;
+    cursor: pointer; font-family: inherit; font-weight: 600;
+    transition: opacity 150ms ease;
+  }}
+  .pr-actions button:hover {{ opacity: 0.88; }}
+  .pr-btn-approve {{ background: var(--bc-success); }}
+  .pr-btn-reject  {{ background: var(--bc-danger); }}
+  .pr-btn-comment {{ background: var(--bc-ink-muted); }}
   .pr-buyer-comment {{
-    background: #eaf4fb; border-left: 4px solid #2980b9;
-    padding: 10px 12px; border-radius: 6px; margin: 10px 0; font-size: 13px;
+    background: var(--bc-info-soft); border-left: 4px solid var(--bc-info);
+    padding: 10px 12px; border-radius: var(--bc-radius-input); margin: 10px 0; font-size: 13px;
   }}
 </style>
 
@@ -1802,9 +1570,13 @@ function renderRequestDetail(data) {{
 
 async function decideRequest(decision) {{
   if (!approvalSelectedId) return;
+  if (window._prDecidePending) return;
+  window._prDecidePending = true;
   const comment = (document.getElementById('approvalComment').value || '').trim();
   const errEl = document.getElementById('approvalError');
   errEl.style.display = 'none';
+  const buttons = document.querySelectorAll('.pr-actions button');
+  buttons.forEach(b => {{ b.disabled = true; }});
   try {{
     const fd = new FormData();
     fd.append('decision', decision);
@@ -1823,6 +1595,9 @@ async function decideRequest(decision) {{
   }} catch (e) {{
     errEl.style.display = 'block';
     errEl.textContent = 'Не удалось применить решение: ' + e.message;
+    buttons.forEach(b => {{ b.disabled = false; }});
+  }} finally {{
+    window._prDecidePending = false;
   }}
 }}
 </script>
@@ -1846,8 +1621,8 @@ def _upload_form_html() -> str:
   <div class="icon">📁</div>
   <p>Нажмите для выбора или перетащите файл <strong>.xlsx</strong> сюда</p>
   <p class="filename" id="fileLabel"></p>
+  <input type="file" id="fileInput" accept=".xlsx,.xls">
 </div>
-<input type="file" id="fileInput" accept=".xlsx,.xls">
 
 <button id="importBtn" disabled onclick="startImport()">Импортировать</button>
 

@@ -49,6 +49,59 @@ def test_stage_resolution_fallback_with_null_system_type() -> None:
 @pytest.mark.asyncio
 async def test_api_task_context_returns_filtered_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     """task-context endpoint should return all sections filtered by etap/zadacha."""
+    from contextlib import asynccontextmanager
+
+    # Mock get_db to avoid opening a real SQLite file
+    @asynccontextmanager
+    async def fake_get_db():
+        yield object()
+
+    monkeypatch.setattr(webhook_handler, "get_db", fake_get_db)
+
+    async def fake_get_materials(conn: object, project_id: int, phase: Any = None, task_name: Any = None) -> list:
+        all_rows = [
+            {"material_name": "Бетон", "unit": "м3", "qty_stock": 10, "qty_plan": 20, "qty_bought": 5, "price_plan": 0},
+            {"material_name": "Песок", "unit": "кг", "qty_stock": 7, "qty_plan": 10, "qty_bought": 3, "price_plan": 0},
+        ]
+        if phase == "Этап 1" and task_name == "Задача 1":
+            return [all_rows[0]]
+        return all_rows
+
+    async def fake_get_labor(conn: object, project_id: int, phase: Any = None, task_name: Any = None) -> list:
+        all_rows = [
+            {"specialty": "Иванов", "phase": "Этап 1", "task_name": "Задача 1"},
+            {"specialty": "Петров", "phase": "Этап 2", "task_name": "Задача 2"},
+        ]
+        if phase == "Этап 1" and task_name == "Задача 1":
+            return [all_rows[0]]
+        return all_rows
+
+    async def fake_get_equipment(conn: object, project_id: int, phase: Any = None, task_name: Any = None) -> list:
+        all_rows = [
+            {"equipment_name": "Кран", "phase": "Этап 1", "task_name": "Задача 1"},
+            {"equipment_name": "Экскаватор", "phase": "Этап 2", "task_name": "Задача 2"},
+        ]
+        if phase == "Этап 1" and task_name == "Задача 1":
+            return [all_rows[0]]
+        return all_rows
+
+    monkeypatch.setattr(webhook_handler.repo, "get_materials", fake_get_materials)
+    monkeypatch.setattr(webhook_handler.repo, "get_labor", fake_get_labor)
+    monkeypatch.setattr(webhook_handler.repo, "get_equipment", fake_get_equipment)
+
+    # Subtasks still come from Bitrix — mock _get_list_context for that only
+    sub_field_map = {
+        "Этап": 1,
+        "Задача": 2,
+        "Статус": 3,
+        "Дата нач. план": 4,
+        "Дата ок. план": 5,
+        "№": 6,
+    }
+    subtasks = [
+        _make_element(31, "Подзадача B", {1: "Этап 1", 2: "Задача 1", 3: "Новая", 4: "2026-04-01", 5: "2026-04-03", 6: 2}),
+        _make_element(30, "Подзадача A", {1: "Этап 1", 2: "Задача 1", 3: "В работе", 4: "2026-04-01", 5: "2026-04-02", 6: 1}),
+    ]
 
     class DummyClientCtx:
         async def __aenter__(self) -> object:
@@ -59,56 +112,7 @@ async def test_api_task_context_returns_filtered_payload(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(webhook_handler, "BitrixClient", lambda: DummyClientCtx())
 
-    mat_field_map = {
-        "Этап": 1,
-        "Задача": 2,
-        "Ед.изм": 3,
-        "Остаток на складе": 4,
-        "Объём план": 5,
-        "Объём куплено": 6,
-    }
-    labor_field_map = {
-        "Этап": 1,
-        "Задача": 2,
-        "Специальность": 3,
-    }
-    equip_field_map = {
-        "Этап": 1,
-        "Задача": 2,
-    }
-    sub_field_map = {
-        "Этап": 1,
-        "Задача": 2,
-        "Статус": 3,
-        "Дата нач. план": 4,
-        "Дата ок. план": 5,
-        "№": 6,
-    }
-
-    materials = [
-        _make_element(1, "Бетон", {1: "Этап 1", 2: "Задача 1", 3: "м3", 4: 10, 5: 20, 6: 5}),
-        _make_element(2, "Песок", {1: "Этап 2", 2: "Задача 2", 3: "кг", 4: 7, 5: 10, 6: 3}),
-    ]
-    labor = [
-        _make_element(10, "Иванов", {1: "Этап 1", 2: "Задача 1", 3: "Каменщик"}),
-        _make_element(11, "Петров", {1: "Этап 2", 2: "Задача 2", 3: "Прораб"}),
-    ]
-    equipment = [
-        _make_element(20, "Кран", {1: "Этап 1", 2: "Задача 1"}),
-        _make_element(21, "Экскаватор", {1: "Этап 2", 2: "Задача 2"}),
-    ]
-    subtasks = [
-        _make_element(31, "Подзадача B", {1: "Этап 1", 2: "Задача 1", 3: "Новая", 4: "2026-04-01", 5: "2026-04-03", 6: 2}),
-        _make_element(30, "Подзадача A", {1: "Этап 1", 2: "Задача 1", 3: "В работе", 4: "2026-04-01", 5: "2026-04-02", 6: 1}),
-    ]
-
     async def fake_get_list_context(client: object, project_id: int, keyword: str) -> Any:
-        if keyword == "материал":
-            return 3, "materials", mat_field_map, materials
-        if keyword == "трудозатрат":
-            return 4, "labor", labor_field_map, labor
-        if keyword == "техник":
-            return 5, "equipment", equip_field_map, equipment
         if keyword == "подзадач":
             return 6, "subtasks", sub_field_map, subtasks
         return None

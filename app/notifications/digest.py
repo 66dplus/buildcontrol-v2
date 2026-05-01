@@ -30,6 +30,173 @@ from app.notifications.telegram import send_telegram
 logger = logging.getLogger(__name__)
 
 
+async def send_weekly_digest() -> None:
+    """
+    Build and send the weekly digest for top management every Monday at 09:00 MSK.
+    Focuses on KPIs across all projects: budget %, schedule %, deviations, purchases.
+    """
+    logger.info("Weekly digest: starting...")
+
+    try:
+        async with BitrixClient() as client:
+            projects = await workgroups.list_projects(client)
+
+        if not projects:
+            logger.info("Weekly digest: no active projects found")
+            return
+
+        week_start = date.today() - timedelta(days=7)
+        project_summaries: list[str] = []
+        total_budget_plan = 0.0
+        total_budget_fact = 0.0
+        projects_with_overrun: list[str] = []
+        projects_behind_schedule: list[str] = []
+
+        for proj in projects:
+            project_id = int(proj["id"])
+            project_name = proj.get("name", f"Проект #{project_id}")
+
+            try:
+                async with BitrixClient() as client:
+                    summary = await _build_weekly_project_summary(
+                        client, project_id, project_name
+                    )
+                if summary:
+                    project_summaries.append(summary["text"])
+                    total_budget_plan += summary["budget_plan"]
+                    total_budget_fact += summary["budget_fact"]
+                    if summary["has_budget_overrun"]:
+                        projects_with_overrun.append(project_name)
+                    if summary["has_schedule_slip"]:
+                        projects_behind_schedule.append(project_name)
+            except Exception as e:
+                logger.error(f"Weekly digest: failed for project {project_id}: {e}")
+
+        if not project_summaries:
+            logger.info("Weekly digest: nothing to report")
+            return
+
+        # Header with cross-project totals
+        today_str = date.today().strftime("%d.%m.%Y")
+        week_start_str = week_start.strftime("%d.%m.%Y")
+        overall_pct = (total_budget_fact / total_budget_plan * 100) if total_budget_plan > 0 else 0
+
+        header_lines = [
+            f"📅 <b>Недельный дайджест — {week_start_str} – {today_str}</b>",
+            f"Активных объектов: <b>{len(projects)}</b>",
+        ]
+        if total_budget_plan > 0:
+            header_lines.append(
+                f"💰 Общий бюджет: <b>{_fmt_rub(total_budget_fact)}</b> / {_fmt_rub(total_budget_plan)} "
+                f"({overall_pct:.0f}%)"
+            )
+        if projects_with_overrun:
+            names = ", ".join(projects_with_overrun[:3])
+            suffix = f" и ещё {len(projects_with_overrun) - 3}" if len(projects_with_overrun) > 3 else ""
+            header_lines.append(f"🔴 Перерасход: {_esc(names)}{suffix}")
+        if projects_behind_schedule:
+            names = ", ".join(projects_behind_schedule[:3])
+            suffix = f" и ещё {len(projects_behind_schedule) - 3}" if len(projects_behind_schedule) > 3 else ""
+            header_lines.append(f"⏰ Отстают от графика: {_esc(names)}{suffix}")
+
+        full_message = "\n".join(header_lines) + "\n" + "━" * 24 + "\n\n" + "\n\n".join(project_summaries)
+        await send_telegram(full_message)
+        logger.info("Weekly digest: sent successfully")
+
+    except Exception as e:
+        logger.error(f"Weekly digest failed: {e}", exc_info=True)
+
+
+def _fmt_rub(value: float) -> str:
+    """Format a number as RUB with thousands separator."""
+    return f"{value:,.0f} ₽".replace(",", " ")
+
+
+async def _build_weekly_project_summary(
+    client: BitrixClient,
+    project_id: int,
+    project_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Build a one-line KPI summary for one project (weekly view)."""
+    ctx = await _get_list_context(client, project_id, "задач")
+    if not ctx:
+        return None
+
+    _, _, field_map, elements = ctx
+
+    pid_pct = lists._resolve_filter_pid(field_map, "готовн. факт")
+    if not pid_pct:
+        pid_pct = lists._resolve_filter_pid(field_map, "готовн факт")
+    pid_budget_plan = lists._resolve_filter_pid(field_map, "бюджет план")
+    pid_budget_fact = lists._resolve_filter_pid(field_map, "бюджет факт")
+    pid_start_plan = _find_pid(field_map, "нач. план")
+    if not pid_start_plan:
+        pid_start_plan = _find_pid(field_map, "нач план")
+    pid_end_plan = _find_pid(field_map, "ок. план")
+    if not pid_end_plan:
+        pid_end_plan = _find_pid(field_map, "ок план")
+
+    total_tasks = len(elements)
+    if total_tasks == 0:
+        return None
+
+    budget_plan = 0.0
+    budget_fact = 0.0
+    avg_pct = 0.0
+    slipping_tasks = 0
+    overrun_tasks = 0
+    today = date.today()
+
+    for elem in elements:
+        pct = float(lists.get_prop_value(elem, pid_pct) or 0) if pid_pct else 0.0
+        avg_pct += pct
+
+        bp = float(lists.get_prop_value(elem, pid_budget_plan) or 0) if pid_budget_plan else 0.0
+        bf = float(lists.get_prop_value(elem, pid_budget_fact) or 0) if pid_budget_fact else 0.0
+        budget_plan += bp
+        budget_fact += bf
+
+        if bp > 0 and bf / bp >= 0.80 and pct < 70.0:
+            overrun_tasks += 1
+
+        if pid_start_plan and pid_end_plan:
+            start_raw = lists.get_prop_value_str(elem, pid_start_plan)
+            end_raw = lists.get_prop_value_str(elem, pid_end_plan)
+            if start_raw and end_raw:
+                start_dt = _parse_date(start_raw)
+                end_dt = _parse_date(end_raw)
+                if start_dt and end_dt and today >= start_dt:
+                    total_days = (end_dt - start_dt).days
+                    if total_days > 0:
+                        elapsed = (today - start_dt).days
+                        expected_pct = min(100.0, elapsed / total_days * 100.0)
+                        if expected_pct - pct >= 20.0:
+                            slipping_tasks += 1
+
+    avg_pct = avg_pct / total_tasks if total_tasks > 0 else 0.0
+    budget_pct = (budget_fact / budget_plan * 100) if budget_plan > 0 else 0.0
+
+    lines = [f"🏗 <b>{_esc(project_name)}</b>"]
+    lines.append(f"  📊 Готовность: <b>{avg_pct:.0f}%</b> | Задач: {total_tasks}")
+    if budget_plan > 0:
+        budget_icon = "🔴" if budget_pct > 90 and avg_pct < 70 else "💰"
+        lines.append(
+            f"  {budget_icon} Бюджет: <b>{_fmt_rub(budget_fact)}</b> / {_fmt_rub(budget_plan)} ({budget_pct:.0f}%)"
+        )
+    if overrun_tasks:
+        lines.append(f"  ⚠️ Задач с перерасходом: {overrun_tasks}")
+    if slipping_tasks:
+        lines.append(f"  ⏰ Отстают от графика: {slipping_tasks}")
+
+    return {
+        "text": "\n".join(lines),
+        "budget_plan": budget_plan,
+        "budget_fact": budget_fact,
+        "has_budget_overrun": overrun_tasks > 0,
+        "has_schedule_slip": slipping_tasks > 0,
+    }
+
+
 async def send_morning_digest() -> None:
     """
     Build and send the daily morning digest for all active projects.

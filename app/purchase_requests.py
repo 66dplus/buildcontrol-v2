@@ -26,6 +26,8 @@ from bitrix.client import BitrixClient
 from bitrix.methods import disk as disk_methods
 from bitrix.methods import lists, tasks as tasks_methods, workgroups
 from config import settings
+from db.database import get_db
+from db import repo
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +276,56 @@ async def _fetch_material_usage(
     return result
 
 
+async def materials_plan_index(
+    client: BitrixClient,
+    project_id: int,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Read project's "3. Материалы" list once and return:
+        { lower(material_name): {"price_plan": float|None, "unit": str} }
+    Used by approval-detail to resolve per-item plan price without N×Bitrix calls.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        all_lists = await lists.get_lists(client, project_id)
+        target = lists.find_list_by_keyword(all_lists, "материал")
+        if not target:
+            return out
+        list_id = int(target["ID"])
+        iblock_code = target.get("IBLOCK_CODE", "")
+        fields_resp = await lists.get_fields(client, list_id, iblock_code, project_id)
+        field_map = lists.resolve_field_map(fields_resp)
+        elements = await lists.get_elements(client, list_id, iblock_code, project_id)
+        pid_price_plan = next(
+            (pid for n, pid in field_map.items() if "цена ед" in n.lower() and "план" in n.lower()),
+            None,
+        )
+        pid_unit = next(
+            (pid for n, pid in field_map.items()
+             if "цена" not in n.lower()
+             and any(kw in n.lower() for kw in ["ед. изм", "ед.изм", "единиц", "unit"])),
+            None,
+        )
+        for elem in elements:
+            name = (elem.get("NAME") or "").strip()
+            if not name:
+                continue
+            entry: Dict[str, Any] = {"price_plan": None, "unit": ""}
+            if pid_price_plan:
+                v = lists.get_prop_value(elem, pid_price_plan)
+                if v is not None:
+                    try:
+                        entry["price_plan"] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+            if pid_unit:
+                entry["unit"] = lists.get_prop_value_str(elem, pid_unit) or ""
+            out[name.lower()] = entry
+    except Exception as e:
+        logger.warning(f"materials_plan_index: project {project_id} read failed: {e}")
+    return out
+
+
 async def material_context(
     client: BitrixClient,
     project_id: int,
@@ -369,8 +421,6 @@ async def _apply_buyer_purchase(
     ``items``: list of dicts with at least ``material_name``, ``qty``, ``price``.
     Returns: ``{"updated": [...names], "errors": [...], "warnings": [...], "cascade_pairs": set}``.
     """
-    from utils.cascade import cascade_update_task, cascade_update_budget  # local import to avoid cycle
-
     all_lists = await lists.get_lists(client, project_id)
     target = lists.find_list_by_keyword(all_lists, "материал")
     if not target:
@@ -455,17 +505,26 @@ async def _apply_buyer_purchase(
         updated.append(mat_name)
         logger.info(f"Approved purchase applied: '{mat_name}' qty+={qty_bought} project {project_id}")
 
-    if cascade_pairs:
+        # Mirror to SQLite
         try:
-            unique_etaps: set[str] = set()
-            for etap_val, zadacha_val in cascade_pairs:
-                await cascade_update_task(client, project_id, etap_val, zadacha_val)
-                unique_etaps.add(etap_val)
-            for etap_val in unique_etaps:
-                await cascade_update_budget(client, project_id, etap_val)
-        except Exception as cascade_err:
-            logger.error(f"Cascade after approval failed for project {project_id}: {cascade_err}", exc_info=True)
+            prev_qty = float(lists.get_prop_value(elem, pid_qty_bought) or 0.0) if pid_qty_bought else 0.0
+            prev_price = float(lists.get_prop_value(elem, pid_price_fact) or 0.0) if pid_price_fact else 0.0
+            new_total_qty = prev_qty + qty_bought
+            new_total_cost = (prev_qty * prev_price) + total_cost
+            new_price_actual = round(new_total_cost / new_total_qty, 2) if new_total_qty > 0 else unit_price
+            async with get_db() as db_conn:
+                await repo.update_material_after_purchase(
+                    db_conn, project_id,
+                    etap_val if (pid_etap and pid_zadacha) else "",
+                    zadacha_val if (pid_etap and pid_zadacha) else "",
+                    mat_name, qty_bought, new_price_actual,
+                )
+        except Exception as db_err:
+            logger.warning(f"SQLite material purchase update failed: {db_err}")
 
+    # NOTE: cascade is intentionally NOT triggered here. Approval only updates
+    # Объём куплено / Остаток / Цена ед. факт — none of which feed Стоим. факт.
+    # Стоим. факт changes only when Объём израсходовано moves (foreman report path).
     return {"updated": updated, "errors": errors, "warnings": warnings, "cascade_pairs": cascade_pairs}
 
 
@@ -534,11 +593,17 @@ async def create_request(
     request_no = _next_request_no(existing, field_ids.get("f_pr_no"))
 
     # --- compute material context for the first item (used in TG/page summary)
+    # SQLite-only — Bitrix fan-out has been retired from the critical path.
     primary_item = items[0] if items else {"material_name": "", "qty": 0, "price": 0}
-    ctx = await material_context(
-        client, project_id, primary_item.get("material_name", ""),
-        float(primary_item.get("qty") or 0), float(primary_item.get("price") or 0),
+    ctx = await material_context_sqlite(
+        project_id, primary_item.get("material_name", ""),
+        float(primary_item.get("qty") or 0),
     )
+    price_plan = ctx.get("price_plan")
+    if price_plan and float(primary_item.get("price") or 0) > 0:
+        ctx["price_deviation_pct"] = round(
+            (float(primary_item["price"]) - float(price_plan)) / float(price_plan) * 100.0, 1
+        )
     if not primary_item.get("unit") and ctx.get("unit"):
         for it in items:
             if not it.get("unit"):
@@ -583,63 +648,34 @@ async def create_request(
     )
     request_id = int(request_id)
 
+    # Mirror to SQLite (non-blocking — Bitrix row is the primary record until migration)
+    try:
+        async with get_db() as db_conn:
+            await repo.create_purchase_request(
+                db_conn,
+                request_id=str(request_id),
+                project_id=project_id,
+                items=items,
+                buyer_comment=buyer_comment,
+                proposal_filename=file_name or "",
+                file_url=file_url,
+            )
+    except Exception as db_err:
+        logger.warning("SQLite create_purchase_request failed: %s", db_err)
+
     # --- build approval URL now that we have request_id
     page_url = approval_url(request_id)
 
-    # --- create audit task in Bitrix
-    items_block = "\n".join(
-        f"• {it.get('material_name', '')}: {it.get('qty')} {it.get('unit', ctx.get('unit') or '')} × "
-        f"{it.get('price')} ₽ = {it.get('total') or float(it.get('qty') or 0) * float(it.get('price') or 0):.2f} ₽"
-        for it in items
-    )
-    description = (
-        f"[B]Заявка на закупку №{request_no}[/B] (проект: {project_name})\n"
-        f"Автор: {author}\n"
-        f"Этап: {etap or '—'} / Задача: {zadacha or '—'}\n"
-        f"\n[B]Позиции:[/B]\n{items_block}\n\n"
-        f"[B]Открыть форму согласования:[/B]\n{page_url}\n"
-    )
-    if buyer_comment:
-        description += f"\n[B]Комментарий закупщика:[/B] {buyer_comment}\n"
-    if file_url:
-        description += f"\n[B]Документ поставщика:[/B] {file_url}\n"
-
-    uf_fields: Dict[str, Any] = {}
-    if file_disk_id:
-        uf_fields["UF_TASK_WEBDAV_FILES"] = disk_methods.task_webdav_files_value([file_disk_id])
-
-    task_id = 0
+    # --- send Telegram with rich body + inline keyboard (synchronous so the
+    #     approver gets pinged immediately).
     try:
-        task_id = await tasks_methods.create_task(
-            client,
-            title=f"Заявка на закупку №{request_no} — {primary_item.get('material_name', '')}",
-            responsible_id=settings.purchase_approver_user_id,
-            description=description,
-            group_id=project_id,
-            uf_fields=uf_fields or None,
-        )
-    except Exception as e:
-        logger.error(f"Audit task creation failed for request {request_id}: {e}")
-
-    if task_id and field_ids.get("f_pr_btask_id"):
-        try:
-            elem_after = await lists.get_elements(client, list_id, iblock_code, project_id)
-            row = next((r for r in elem_after if int(r["ID"]) == request_id), None)
-            if row:
-                merged = lists.extract_all_prop_values(row)
-                merged[field_ids["f_pr_btask_id"]] = task_id
-                await lists.update_element(
-                    client, list_id, iblock_code, project_id, request_id, merged, name=row_name,
-                )
-        except Exception as e:
-            logger.warning(f"Failed to write Bitrix task ID back to request {request_id}: {e}")
-
-    # --- send Telegram with rich body + inline keyboard
-    try:
+        # Per-request signed approval URL — opens our approval page directly.
+        approval_link = page_url
         msg = _format_telegram_body(
             request_no=request_no, project_name=project_name, author=author,
             etap=etap, zadacha=zadacha, items=items, total_sum=total_sum,
-            ctx=ctx, file_url=file_url, buyer_comment=buyer_comment,
+            ctx=ctx, file_url=file_url, approval_link=approval_link,
+            buyer_comment=buyer_comment,
         )
         keyboard = [
             [
@@ -647,7 +683,7 @@ async def create_request(
                 {"text": "❌ Отклонить", "callback_data": f"pr:reject:{request_id}"},
             ],
             [
-                {"text": "📝 Открыть форму", "url": page_url},
+                {"text": "📝 Открыть форму", "url": approval_link},
                 {"text": "💬 Написать", "callback_data": f"pr:comment:{request_id}"},
             ],
         ]
@@ -658,9 +694,92 @@ async def create_request(
     return {
         "request_id": request_id,
         "request_no": request_no,
-        "task_id": task_id,
+        "task_id": 0,  # audit task is created in the background; ID is written to SQLite later
         "context": ctx,
+        # Inputs the caller can hand to ``create_audit_task_background`` so the
+        # heavy Bitrix audit-task work runs after the HTTP response.
+        "_audit_task_inputs": {
+            "request_id": request_id,
+            "request_no": request_no,
+            "project_id": project_id,
+            "project_name": project_name,
+            "author": author,
+            "etap": etap,
+            "zadacha": zadacha,
+            "items": items,
+            "buyer_comment": buyer_comment,
+            "file_url": file_url,
+            "file_disk_id": file_disk_id,
+            "page_url": page_url,
+            "primary_item_name": primary_item.get("material_name", ""),
+            "list_id": list_id,
+            "iblock_code": iblock_code,
+            "f_pr_btask_id": field_ids.get("f_pr_btask_id"),
+            "row_name": row_name,
+            "ctx_unit": ctx.get("unit") or "",
+        },
     }
+
+
+async def create_audit_task_background(inputs: Dict[str, Any]) -> None:
+    """Create the Bitrix audit task and write its ID back to the request row.
+
+    Runs after the HTTP response has been returned. Errors are logged.
+    """
+    items_block = "\n".join(
+        f"• {it.get('material_name', '')}: {it.get('qty')} {it.get('unit') or inputs.get('ctx_unit', '')} × "
+        f"{it.get('price')} ₽ = {it.get('total') or float(it.get('qty') or 0) * float(it.get('price') or 0):.2f} ₽"
+        for it in inputs["items"]
+    )
+    description = (
+        f"[B]Заявка на закупку №{inputs['request_no']}[/B] (проект: {inputs['project_name']})\n"
+        f"Автор: {inputs['author']}\n"
+        f"Этап: {inputs['etap'] or '—'} / Задача: {inputs['zadacha'] or '—'}\n"
+        f"\n[B]Позиции:[/B]\n{items_block}\n\n"
+        f"[B]Открыть форму согласования:[/B]\n{inputs['page_url']}\n"
+    )
+    if inputs.get("buyer_comment"):
+        description += f"\n[B]Комментарий закупщика:[/B] {inputs['buyer_comment']}\n"
+    if inputs.get("file_url"):
+        description += f"\n[B]Документ поставщика:[/B] {inputs['file_url']}\n"
+
+    uf_fields: Dict[str, Any] = {}
+    if inputs.get("file_disk_id"):
+        uf_fields["UF_TASK_WEBDAV_FILES"] = disk_methods.task_webdav_files_value([inputs["file_disk_id"]])
+
+    request_id = inputs["request_id"]
+    project_id = inputs["project_id"]
+
+    try:
+        async with BitrixClient() as client:
+            try:
+                task_id = await tasks_methods.create_task(
+                    client,
+                    title=f"Заявка на закупку №{inputs['request_no']} — {inputs['primary_item_name']}",
+                    responsible_id=settings.purchase_approver_user_id,
+                    description=description,
+                    group_id=project_id,
+                    uf_fields=uf_fields or None,
+                )
+            except Exception as e:
+                logger.error(f"BG audit task creation failed for request {request_id}: {e}")
+                return
+
+            if task_id and inputs.get("f_pr_btask_id"):
+                try:
+                    elem_after = await lists.get_elements(client, inputs["list_id"], inputs["iblock_code"], project_id)
+                    row = next((r for r in elem_after if int(r["ID"]) == request_id), None)
+                    if row:
+                        merged = lists.extract_all_prop_values(row)
+                        merged[inputs["f_pr_btask_id"]] = task_id
+                        await lists.update_element(
+                            client, inputs["list_id"], inputs["iblock_code"], project_id,
+                            request_id, merged, name=inputs.get("row_name"),
+                        )
+                except Exception as e:
+                    logger.warning(f"BG: failed to write Bitrix task ID back to request {request_id}: {e}")
+    except Exception as outer:
+        logger.error(f"BG audit task: unexpected error for {request_id}: {outer}", exc_info=True)
 
 
 def _format_telegram_body(
@@ -674,6 +793,7 @@ def _format_telegram_body(
     total_sum: float,
     ctx: Dict[str, Any],
     file_url: str,
+    approval_link: str,
     buyer_comment: str = "",
 ) -> str:
     """Build the rich HTML body for the approver's Telegram message."""
@@ -726,7 +846,7 @@ def _format_telegram_body(
 
     if file_url:
         lines.append("")
-        lines.append(f'📎 <a href="{esc(file_url)}">Коммерческое предложение</a>')
+        lines.append(f'📎 <a href="{esc(approval_link)}">Коммерческое предложение</a>')
 
     return "\n".join(lines)
 
@@ -749,10 +869,40 @@ async def list_pending_across_projects(
     client: BitrixClient,
 ) -> List[Dict[str, Any]]:
     """
-    Walk all projects and return every purchase request whose status is PENDING,
-    flattened for the Bitrix-widget approver view.
+    Return all pending purchase requests.
+
+    Primary path: SQLite single-query (fast, no Bitrix rate-limit).
+    Fallback: Bitrix fan-out across all projects (original slow path).
     """
-    out: List[Dict[str, Any]] = []
+    # --- SQLite fast path ---
+    try:
+        async with get_db() as db_conn:
+            rows = await repo.get_pending_purchase_requests(db_conn)
+        if rows:
+            out = []
+            for r in rows:
+                items = r.get("items") or []
+                primary = items[0] if items else {}
+                out.append({
+                    "project_id": r["project_id"],
+                    "project_name": r.get("project_name", f"Проект #{r['project_id']}"),
+                    "request_id": r["id"],
+                    "request_no": 0,
+                    "date": (r.get("created_at") or "")[:10],
+                    "author": r.get("buyer_comment", "")[:40],
+                    "material": primary.get("material_name", ""),
+                    "qty": float(primary.get("qty") or 0),
+                    "unit": primary.get("unit") or "",
+                    "total_sum": _items_total(items),
+                    "file_url": "",
+                })
+            out.sort(key=lambda r: r["date"] or "", reverse=True)
+            return out
+    except Exception as db_err:
+        logger.warning("list_pending_across_projects SQLite failed, falling back to Bitrix: %s", db_err)
+
+    # --- Bitrix fallback (for projects not yet in SQLite) ---
+    out = []
     try:
         projects = await workgroups.list_projects(client)
     except Exception as e:
@@ -816,6 +966,363 @@ async def find_request_in_any_project(
     return None
 
 
+async def find_request_sqlite(request_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Look up a purchase request from SQLite by ID.
+    Returns a decoded request dict (same shape as _row_to_request output) or None.
+
+    Defensive: if items_json is missing or malformed, returns an empty items list
+    rather than raising — so the approval page can still render and the operator
+    can recover from a corrupt row.
+    """
+    try:
+        async with get_db() as conn:
+            row = await repo.get_purchase_request(conn, str(request_id))
+        if not row:
+            return None
+        project_id = int(row.get("project_id") or 0)
+        if not project_id:
+            return None
+        items = row.get("items") or []
+        if not isinstance(items, list):
+            items = []
+        return {
+            "id": int(row["id"]),
+            "name": f"Заявка #{row['id']}",
+            "no": 0,
+            "date": (row.get("created_at") or "")[:10],
+            "author": row.get("actor") or "",
+            "etap": "",
+            "zadacha": "",
+            "items": items,
+            "file_url": row.get("file_url") or "",
+            "status": _sqlite_status_to_display(row.get("status", "pending")),
+            "bitrix_task_id": 0,
+            "comment": row.get("buyer_comment") or "",
+            "history": [],
+            "project_id": project_id,
+        }
+    except Exception as exc:
+        logger.warning("find_request_sqlite(%s) failed: %s", request_id, exc)
+        return None
+
+
+def _sqlite_status_to_display(status: str) -> str:
+    return {
+        "pending": STATUS_PENDING,
+        "approved": STATUS_APPROVED,
+        "rejected": STATUS_REJECTED,
+    }.get(status, STATUS_PENDING)
+
+
+async def material_context_sqlite(
+    project_id: int, material_name: str, qty: float,
+) -> Dict[str, Any]:
+    """SQLite-only equivalent of ``material_context``.
+
+    Returns the same shape as ``material_context`` but reads everything from
+    the local SQLite mirror — no Bitrix calls, no cross-project fan-out.
+    Used in the synchronous buyer-create path to keep response time low.
+    """
+    out: Dict[str, Any] = {
+        "unit": "", "qty_plan": None, "price_plan": None,
+        "price_deviation_pct": None, "over_plan": False,
+        "stock_now": None, "active_projects": None, "future_projects": None,
+    }
+    try:
+        async with get_db() as conn:
+            # Aggregate own-project totals across phases/tasks
+            async with conn.execute(
+                """
+                SELECT
+                    MAX(unit) AS unit,
+                    SUM(qty_plan) AS qty_plan,
+                    AVG(CASE WHEN price_plan > 0 THEN price_plan END) AS price_plan,
+                    SUM(qty_stock) AS stock_now,
+                    SUM(qty_bought) AS qty_bought
+                FROM materials
+                WHERE project_id=? AND material_name=?
+                """,
+                (project_id, material_name),
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                out["unit"] = row["unit"] or ""
+                out["qty_plan"] = float(row["qty_plan"] or 0) or None
+                if row["price_plan"]:
+                    out["price_plan"] = float(row["price_plan"])
+                out["stock_now"] = float(row["stock_now"] or 0)
+                if out["qty_plan"] and (float(row["qty_bought"] or 0) + qty) > out["qty_plan"]:
+                    out["over_plan"] = True
+
+            # Cross-project counts — single fast SQL, no Bitrix needed
+            async with conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN bought_or_used > 0 THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN plan_only > 0 THEN 1 ELSE 0 END) AS future
+                FROM (
+                    SELECT
+                        project_id,
+                        SUM(qty_bought) + SUM(qty_consumed) AS bought_or_used,
+                        CASE WHEN SUM(qty_plan) > 0 AND SUM(qty_consumed) = 0 THEN 1 ELSE 0 END AS plan_only
+                    FROM materials
+                    WHERE material_name=?
+                    GROUP BY project_id
+                )
+                """,
+                (material_name,),
+            ) as cur:
+                xrow = await cur.fetchone()
+            if xrow:
+                out["active_projects"] = int(xrow["active"] or 0)
+                out["future_projects"] = int(xrow["future"] or 0)
+    except Exception as e:
+        logger.warning("material_context_sqlite: project %d failed: %s", project_id, e)
+    return out
+
+
+async def materials_plan_index_sqlite(project_id: int) -> Dict[str, Dict[str, Any]]:
+    """
+    Read plan prices + units from SQLite instead of Bitrix.
+    Returns { lower(material_name): {"price_plan": float|None, "unit": str} }
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        async with get_db() as conn:
+            rows = await repo.get_materials(conn, project_id)
+        for r in rows:
+            name = (r.get("material_name") or "").strip()
+            if not name:
+                continue
+            out[name.lower()] = {
+                "price_plan": r.get("price_plan"),
+                "unit": r.get("unit") or "",
+            }
+    except Exception as exc:
+        logger.warning("materials_plan_index_sqlite: project %d failed: %s", project_id, exc)
+    return out
+
+
+async def mirror_decision_to_bitrix(
+    request_id: int,
+    project_id: int,
+    decision: str,
+    actor: str,
+    source: str,
+    comment: str = "",
+) -> None:
+    """Background helper — mirror an already-resolved decision to Bitrix.
+
+    SQLite is the source of truth and has already been updated by
+    ``resolve_request_sqlite_first``. This function:
+      • finds the Bitrix list row, updates its status + history,
+      • for approve, applies the purchase to Bitrix's "3. Материалы",
+      • posts an audit-task comment and (for approve/reject) closes the task.
+
+    Errors are logged but never raised — the user has already received their
+    HTTP 200 / Telegram ack and shouldn't be affected by Bitrix outages.
+    """
+    try:
+        async with BitrixClient() as client:
+            try:
+                list_info, row, request = await _load_request(client, project_id, request_id)
+            except Exception as load_err:
+                logger.warning(f"BG mirror: Bitrix row {request_id} not found: {load_err}")
+                return
+
+            field_ids: Dict[str, int] = list_info["field_ids"]
+
+            if decision != DECISION_COMMENT and request["status"] != STATUS_PENDING:
+                logger.info(f"BG mirror: Bitrix row {request_id} already resolved, skipping")
+                return
+
+            history = _append_history(request["history"], {
+                "event": decision, "actor": actor, "source": source,
+                "comment": comment or None,
+            })
+
+            if decision == DECISION_APPROVE:
+                try:
+                    await _apply_buyer_purchase(client, project_id, request["items"])
+                except Exception as ap_err:
+                    logger.error(f"BG mirror: _apply_buyer_purchase failed for {request_id}: {ap_err}", exc_info=True)
+                new_status = STATUS_APPROVED
+            elif decision == DECISION_REJECT:
+                new_status = STATUS_REJECTED
+            elif decision == DECISION_COMMENT:
+                new_status = request["status"]
+            else:
+                logger.warning(f"BG mirror: unknown decision {decision} for {request_id}")
+                return
+
+            merged = lists.extract_all_prop_values(row)
+            if field_ids.get("f_pr_status"):
+                merged[field_ids["f_pr_status"]] = new_status
+            if field_ids.get("f_pr_history"):
+                merged[field_ids["f_pr_history"]] = json.dumps(history, ensure_ascii=False)
+            if comment and field_ids.get("f_pr_comment"):
+                prev = request["comment"]
+                merged[field_ids["f_pr_comment"]] = (prev + "\n" if prev else "") + f"[{actor}] {comment}"
+
+            try:
+                await lists.update_element(
+                    client, int(list_info["list_id"]), list_info["iblock_code"], project_id,
+                    request_id, merged, name=row.get("NAME"),
+                )
+            except Exception as upd_err:
+                logger.error(f"BG mirror: list element update failed for {request_id}: {upd_err}", exc_info=True)
+
+            if request["bitrix_task_id"]:
+                try:
+                    tag = {
+                        DECISION_APPROVE: "✅ Подтверждено",
+                        DECISION_REJECT: "❌ Отклонено",
+                        DECISION_COMMENT: "💬 Комментарий",
+                    }[decision]
+                    tag_msg = f"{tag} ({source}) — {actor}"
+                    if comment:
+                        tag_msg += f"\n{comment}"
+                    await tasks_methods.add_task_comment(client, request["bitrix_task_id"], tag_msg)
+                except Exception as e:
+                    logger.warning(f"BG mirror: audit task comment failed for {request_id}: {e}")
+
+                if decision in (DECISION_APPROVE, DECISION_REJECT):
+                    try:
+                        await tasks_methods.complete_task(client, request["bitrix_task_id"])
+                    except Exception as e:
+                        logger.warning(f"BG mirror: audit task complete failed for {request_id}: {e}")
+    except Exception as outer_err:
+        logger.error(f"BG mirror: unexpected error for {request_id}: {outer_err}", exc_info=True)
+
+
+async def resolve_request_sqlite_first(
+    request_id: int,
+    decision: str,
+    actor: str,
+    source: str,
+    comment: str = "",
+) -> Dict[str, Any]:
+    """SQLite-first decision flow.
+
+    1. Look up request in SQLite (fast, no Bitrix calls).
+    2. Idempotency check on SQLite status — if already resolved, return early.
+    3. Update SQLite synchronously (status, resolved_at, actor, comment).
+    4. For approve: apply purchase to local materials so subsequent reports see it.
+
+    Returns ``{"status", "already_resolved", "project_id", "request"}``.
+    Bitrix mirror is the caller's responsibility to schedule as a background task.
+    """
+    from app.notifications.telegram import send_telegram
+
+    sqlite_req = await find_request_sqlite(request_id)
+    if not sqlite_req:
+        return {"status": None, "already_resolved": False, "project_id": None, "request": None}
+
+    project_id = int(sqlite_req["project_id"])
+    current_status = sqlite_req["status"]
+
+    if decision != DECISION_COMMENT and current_status != STATUS_PENDING:
+        logger.info(
+            f"Request {request_id} already resolved as '{current_status}', "
+            f"skipping {decision} from {source}"
+        )
+        return {
+            "status": current_status,
+            "already_resolved": True,
+            "project_id": project_id,
+            "request": sqlite_req,
+        }
+
+    if decision == DECISION_APPROVE:
+        new_status_display = STATUS_APPROVED
+        new_status_sqlite = "approved"
+    elif decision == DECISION_REJECT:
+        new_status_display = STATUS_REJECTED
+        new_status_sqlite = "rejected"
+    else:
+        new_status_display = current_status
+        new_status_sqlite = {
+            STATUS_APPROVED: "approved",
+            STATUS_REJECTED: "rejected",
+        }.get(current_status, "pending")
+
+    try:
+        async with get_db() as db_conn:
+            await repo.update_purchase_request(
+                db_conn, str(request_id),
+                status=new_status_sqlite,
+                resolved_at=_now_iso() if decision != DECISION_COMMENT else None,
+                actor=actor if decision != DECISION_COMMENT else None,
+                approver_comment=comment if comment else None,
+            )
+
+            # For approve: apply purchase to local materials so the SQLite
+            # source-of-truth reflects the approval before background mirror.
+            if decision == DECISION_APPROVE:
+                for it in sqlite_req.get("items", []):
+                    mat_name = (it.get("material_name") or "").strip()
+                    qty = float(it.get("qty") or 0)
+                    price = float(it.get("price") or 0)
+                    if not mat_name or qty <= 0:
+                        continue
+                    plan_row = await repo.get_material_row(
+                        db_conn, project_id, "", "", mat_name,
+                    )
+                    if plan_row is None:
+                        async with db_conn.execute(
+                            "SELECT phase, task_name, qty_bought, price_actual FROM materials "
+                            "WHERE project_id=? AND material_name=? LIMIT 1",
+                            (project_id, mat_name),
+                        ) as cur:
+                            row = await cur.fetchone()
+                        if row is None:
+                            continue
+                        phase = row[0]
+                        task_name = row[1]
+                        prev_qty = float(row[2] or 0)
+                        prev_price = float(row[3] or 0)
+                    else:
+                        phase = plan_row.get("phase") or ""
+                        task_name = plan_row.get("task_name") or ""
+                        prev_qty = float(plan_row.get("qty_bought") or 0)
+                        prev_price = float(plan_row.get("price_actual") or 0)
+                    new_total_qty = prev_qty + qty
+                    new_total_cost = (prev_qty * prev_price) + (qty * price)
+                    new_price_actual = (
+                        round(new_total_cost / new_total_qty, 2) if new_total_qty > 0 else price
+                    )
+                    await repo.update_material_after_purchase(
+                        db_conn, project_id, phase, task_name, mat_name,
+                        qty, new_price_actual,
+                    )
+    except Exception as db_err:
+        logger.error(f"resolve_request_sqlite_first: SQLite write failed for {request_id}: {db_err}", exc_info=True)
+        return {"status": None, "already_resolved": False, "project_id": project_id, "request": None}
+
+    # Telegram ack — synchronous so the approver sees confirmation immediately
+    try:
+        ack_lines = [f"<b>Заявка #{request_id}</b>"]
+        if decision == DECISION_APPROVE:
+            ack_lines.append(f"✅ Подтверждено — {actor} ({source})")
+        elif decision == DECISION_REJECT:
+            ack_lines.append(f"❌ Отклонено — {actor} ({source})")
+        else:
+            ack_lines.append(f"💬 {actor} написал ({source}): {comment}")
+        await send_telegram("\n".join(ack_lines))
+    except Exception as e:
+        logger.warning(f"Telegram ack failed for request {request_id}: {e}")
+
+    refreshed = dict(sqlite_req)
+    refreshed["status"] = new_status_display
+    return {
+        "status": new_status_display,
+        "already_resolved": False,
+        "project_id": project_id,
+        "request": refreshed,
+    }
+
+
 async def resolve_request(
     client: BitrixClient,
     project_id: int,
@@ -874,6 +1381,24 @@ async def resolve_request(
         client, int(list_info["list_id"]), list_info["iblock_code"], project_id,
         request_id, merged, name=row.get("NAME"),
     )
+
+    # Mirror status to SQLite
+    try:
+        status_sqlite = (
+            "approved" if new_status == STATUS_APPROVED
+            else "rejected" if new_status == STATUS_REJECTED
+            else "pending"
+        )
+        async with get_db() as db_conn:
+            await repo.update_purchase_request(
+                db_conn, str(request_id),
+                status=status_sqlite,
+                resolved_at=_now_iso() if decision != DECISION_COMMENT else None,
+                actor=actor if decision != DECISION_COMMENT else None,
+                approver_comment=comment if comment else None,
+            )
+    except Exception as db_err:
+        logger.warning("SQLite resolve_request update failed: %s", db_err)
 
     # Mirror to Bitrix task (audit) and Telegram (ack).
     if request["bitrix_task_id"]:

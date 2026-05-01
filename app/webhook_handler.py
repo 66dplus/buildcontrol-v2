@@ -31,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from bitrix.client import BitrixClient
 from bitrix.methods import lists, tasks as tasks_methods, workgroups
 from config import settings
+from db.database import get_db
+from db import repo
 from scripts.import_excel import ExcelImporter
 from utils.cascade import cascade_update_task, cascade_update_budget
 from app.notifications.alerts import (
@@ -126,11 +128,15 @@ async def _get_list_meta_cached(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Startup/shutdown: manage APScheduler for daily digest."""
+    """Startup/shutdown: init SQLite DB, manage APScheduler for daily digest."""
+    from db.database import init_db
     from app.notifications.digest import send_morning_digest
+
+    await init_db()
 
     scheduler = AsyncIOScheduler()
     if settings.notifications_enabled:
+        from app.notifications.digest import send_weekly_digest
         scheduler.add_job(
             send_morning_digest,
             "cron",
@@ -139,8 +145,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             timezone="Europe/Moscow",
             id="morning_digest",
         )
+        scheduler.add_job(
+            send_weekly_digest,
+            "cron",
+            day_of_week="mon",
+            hour=9,
+            minute=0,
+            timezone="Europe/Moscow",
+            id="weekly_digest",
+        )
         scheduler.start()
-        logger.info("Notification scheduler started — morning digest at 09:00 MSK")
+        logger.info("Notification scheduler started — morning digest at 09:00 MSK, weekly digest on Mondays")
     else:
         logger.info("Notifications disabled — scheduler not started")
 
@@ -239,6 +254,21 @@ async def upload_excel(
         tmp.write(content)
         tmp_path = tmp.name
 
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(tmp_path, read_only=True, data_only=True)
+        wb.close()
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        logger.warning(f"Rejected upload {file.filename}: failed to parse Excel ({e})")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Не удалось открыть Excel-файл: {e}",
+        )
+
     job_id = uuid.uuid4().hex[:10]
     _import_jobs[job_id] = {"status": "running", "filename": file.filename}
     logger.info(f"[job={job_id}] Received {file.filename} ({len(content)} bytes) → {tmp_path}")
@@ -266,13 +296,8 @@ async def import_status(job_id: str) -> JSONResponse:
 @app.get("/api/projects")
 async def api_projects() -> JSONResponse:
     """List all active projects for the report form dropdown."""
-    try:
-        settings.validate()
-    except ValueError as e:
-        raise HTTPException(status_code=500, detail=f"Server config error: {e}")
-
-    async with BitrixClient() as client:
-        projects = await workgroups.list_projects(client)
+    async with get_db() as conn:
+        projects = await repo.get_projects(conn)
     return JSONResponse(content=projects)
 
 
@@ -461,143 +486,107 @@ async def _load_task_context_payload(
 @app.get("/api/projects/{project_id}/materials")
 async def api_materials(project_id: int, request: Request) -> JSONResponse:
     """
-    Return material names/units from the project's "3. Материалы" list.
+    Return material names/units from SQLite.
     Optional query params ?etap=X&zadacha=Y to filter by task.
     """
-    etap = request.query_params.get("etap", "").strip()
-    zadacha = request.query_params.get("zadacha", "").strip()
-
-    async with BitrixClient() as client:
-        ctx = await _get_list_context(client, project_id, "материал")
-        if not ctx:
-            return JSONResponse(content=[])
-
-        _, _, field_map, elements = ctx
-        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
-        materials = _build_materials_payload(filtered, field_map)
-
+    etap = request.query_params.get("etap", "").strip() or None
+    zadacha = request.query_params.get("zadacha", "").strip() or None
+    async with get_db() as conn:
+        if etap or zadacha:
+            rows = await repo.get_materials(conn, project_id, etap, zadacha)
+            materials = [
+                {
+                    "name": r["material_name"],
+                    "unit": r["unit"],
+                    "stock": r["qty_stock"],
+                    "qty_plan": r["qty_plan"],
+                    "qty_bought": r["qty_bought"],
+                    "price_plan": r["price_plan"],
+                }
+                for r in rows
+            ]
+        else:
+            rows = await repo.get_materials_for_buyer(conn, project_id)
+            materials = [
+                {
+                    "name": r["material_name"],
+                    "unit": r["unit"],
+                    "qty_plan": r["qty_plan"],
+                    "qty_bought": r["qty_bought"],
+                    "price_plan": r["price_plan"],
+                }
+                for r in rows
+            ]
     return JSONResponse(content=materials)
 
 
 @app.get("/api/projects/{project_id}/labor")
 async def api_labor(project_id: int, request: Request) -> JSONResponse:
     """
-    Return worker names/roles from the project's "4. Трудозатраты" list.
+    Return worker specialties from SQLite.
     Optional query params ?etap=X&zadacha=Y to filter by task.
     """
-    etap = request.query_params.get("etap", "").strip()
-    zadacha = request.query_params.get("zadacha", "").strip()
-
-    async with BitrixClient() as client:
-        ctx = await _get_list_context(client, project_id, "трудозатрат")
-        if not ctx:
-            return JSONResponse(content=[])
-
-        _, _, field_map, elements = ctx
-        filtered = _filter_task_elements(elements, field_map, etap, zadacha)
-        workers = _build_labor_payload(filtered, field_map)
-
+    etap = request.query_params.get("etap", "").strip() or None
+    zadacha = request.query_params.get("zadacha", "").strip() or None
+    async with get_db() as conn:
+        rows = await repo.get_labor(conn, project_id, etap, zadacha)
+    workers = [{"name": r["specialty"], "role": ""} for r in rows]
     return JSONResponse(content=workers)
 
 
 @app.get("/api/projects/{project_id}/task-context")
 async def api_task_context(project_id: int, request: Request) -> JSONResponse:
     """
-    Return materials, labor, equipment, and subtasks for one task in a single response.
+    Return materials, labor, equipment from SQLite + subtasks from Bitrix.
     Query params: ?etap=X&zadacha=Y
     """
-    etap = request.query_params.get("etap", "").strip()
-    zadacha = request.query_params.get("zadacha", "").strip()
+    etap = request.query_params.get("etap", "").strip() or None
+    zadacha = request.query_params.get("zadacha", "").strip() or None
 
-    async with BitrixClient() as client:
-        payload = await _load_task_context_payload(client, project_id, etap, zadacha)
+    async with get_db() as conn:
+        mat_rows = await repo.get_materials(conn, project_id, etap, zadacha)
+        lab_rows = await repo.get_labor(conn, project_id, etap, zadacha)
+        eq_rows = await repo.get_equipment(conn, project_id, etap, zadacha)
 
-    return JSONResponse(content=payload)
+    materials = [
+        {"name": r["material_name"], "unit": r["unit"], "stock": r["qty_stock"],
+         "qty_plan": r["qty_plan"], "qty_bought": r["qty_bought"], "price_plan": r["price_plan"]}
+        for r in mat_rows
+    ]
+    labor = [{"name": r["specialty"], "role": ""} for r in lab_rows]
+    equipment = [{"name": r["equipment_name"]} for r in eq_rows]
+
+    subtasks: list[dict[str, Any]] = []
+    try:
+        async with BitrixClient() as client:
+            subtasks_ctx = await _get_list_context(client, project_id, "подзадач")
+            if subtasks_ctx:
+                _, _, field_map, elements = subtasks_ctx
+                filtered = _filter_task_elements(elements, field_map, etap or "", zadacha or "")
+                subtasks = _build_subtasks_payload(filtered, field_map)
+    except Exception as exc:
+        logger.warning("api_task_context: subtasks Bitrix call failed: %s", exc)
+
+    return JSONResponse(content={"materials": materials, "labor": labor, "equipment": equipment, "subtasks": subtasks})
 
 
 @app.get("/api/projects/{project_id}/tasks")
 async def api_tasks(project_id: int) -> JSONResponse:
     """
-    Return tasks from the project's "2. Этапы и задачи" list.
-    Each task has etap (phase) and zadacha (task name).
-    Filters out subtasks and de-duplicates collisions deterministically.
+    Return tasks from SQLite. Each task has etap, zadacha, budget_plan, element_id, bitrix_task_id.
     """
-    async with BitrixClient() as client:
-        ctx = await _get_list_context(client, project_id, "задач")
-        if not ctx:
-            return JSONResponse(content=[])
-
-        list_id, iblock_code, field_map, elements = ctx
-
-        pid_etap = lists._resolve_filter_pid(field_map, "этап")
-        pid_zadacha = lists._resolve_filter_pid(field_map, "задача")
-        pid_budget_plan = lists._resolve_filter_pid(field_map, "бюджет план")
-
-        pid_btask_id = lists._resolve_filter_pid(field_map, "bitrix task id")
-
-        try:
-            root_task_ids = await tasks_methods.list_root_task_ids(client, project_id)
-        except Exception as root_err:
-            logger.warning(f"Tasks API: failed to load root task IDs for project {project_id}: {root_err}")
-            root_task_ids = set()
-
-        task_candidates: list[dict[str, Any]] = []
-        for elem in elements:
-            etap = ""
-            zadacha = elem.get("NAME", "")
-            budget_plan = None
-            element_id = int(elem.get("ID", 0))
-            bitrix_task_id = None
-
-            if pid_etap:
-                etap = lists.get_prop_value_str(elem, pid_etap) or ""
-            if pid_zadacha:
-                zadacha = lists.get_prop_value_str(elem, pid_zadacha) or zadacha
-            if pid_budget_plan:
-                budget_plan = lists.get_prop_value(elem, pid_budget_plan)
-            if pid_btask_id:
-                raw = lists.get_prop_value(elem, pid_btask_id)
-                bitrix_task_id = int(raw) if raw else None
-
-            if not zadacha:
-                continue
-
-            # Keep only root Bitrix tasks when link ID is present
-            if bitrix_task_id and root_task_ids and bitrix_task_id not in root_task_ids:
-                continue
-
-            task_candidates.append({
-                "etap": etap,
-                "zadacha": zadacha,
-                "budget_plan": budget_plan,
-                "element_id": element_id,
-                "bitrix_task_id": bitrix_task_id,
-            })
-
-    task_candidates.sort(
-        key=lambda item: (
-            (item.get("etap") or "").lower(),
-            (item.get("zadacha") or "").lower(),
-            int(item.get("element_id") or 0),
-        )
-    )
-
-    task_list: list[dict[str, Any]] = []
-    seen_by_bitrix: set[int] = set()
-    seen_by_pair: set[tuple[str, str]] = set()
-
-    for item in task_candidates:
-        key = ((item.get("etap") or "").strip().lower(), (item.get("zadacha") or "").strip().lower())
-        if key in seen_by_pair:
-            continue
-        btask = item.get("bitrix_task_id")
-        if btask is not None:
-            if btask in seen_by_bitrix:
-                continue
-            seen_by_bitrix.add(int(btask))
-        seen_by_pair.add(key)
-        task_list.append(item)
-
+    async with get_db() as conn:
+        rows = await repo.get_tasks(conn, project_id)
+    task_list = [
+        {
+            "etap": r["phase"],
+            "zadacha": r["task_name"],
+            "budget_plan": r["budget_plan"],
+            "element_id": r["id"],
+            "bitrix_task_id": r["bitrix_task_id"],
+        }
+        for r in rows
+    ]
     return JSONResponse(content=task_list)
 
 
@@ -871,12 +860,16 @@ async def _update_task_progress(
                 logger.warning(f"Task progress: failed to add comment to task {bitrix_task_id}: {e}")
 
         # --- Update list element (Дата нач. факт + Дата ок. факт + % выполнения факт) ---
+        sqlite_pct: Optional[float] = None
+        sqlite_start: Optional[str] = None
+        sqlite_end: Optional[str] = None
         if elem and stage_id:
             elem_id = int(elem["ID"])
             new_vals: Dict[int, Any] = lists.extract_all_prop_values(elem)
 
             # Compute %
             pct = _compute_completion_pct(all_stages, stage_id)
+            sqlite_pct = pct
             if pid_pct_fact:
                 new_vals[pid_pct_fact] = pct
 
@@ -887,14 +880,18 @@ async def _update_task_progress(
             if pid_start_fact and not is_new_stage:
                 cur_start = lists.get_prop_value_str(elem, pid_start_fact)
                 if not cur_start:
-                    new_vals[pid_start_fact] = datetime.now().date().isoformat()
+                    today_iso = datetime.now().date().isoformat()
+                    new_vals[pid_start_fact] = today_iso
+                    sqlite_start = today_iso
                     logger.info(f"Task progress: set Дата нач. факт for element {elem_id}")
 
             # Set end date if stage is FINISH and not already set
             if pid_end_fact and is_finish_stage:
                 cur_end = lists.get_prop_value_str(elem, pid_end_fact)
                 if not cur_end:
-                    new_vals[pid_end_fact] = datetime.now().date().isoformat()
+                    today_iso = datetime.now().date().isoformat()
+                    new_vals[pid_end_fact] = today_iso
+                    sqlite_end = today_iso
                     logger.info(f"Task progress: set Дата ок. факт for element {elem_id}")
 
             if pid_pct_fact or pid_start_fact or pid_end_fact:
@@ -903,6 +900,24 @@ async def _update_task_progress(
                     name=elem.get("NAME"),
                 )
                 logger.info(f"Task progress: updated element {elem_id} — % = {pct}")
+
+        # --- Mirror stage / completion to SQLite so the director agent sees it ---
+        if stage_id:
+            stage_name = tasks_methods.stage_display_name(all_stages, stage_id)
+            try:
+                async with get_db() as db_conn:
+                    await repo.update_task_progress(
+                        db_conn, project_id, task_etap, task_zadacha,
+                        completion_pct=sqlite_pct,
+                        stage_id=str(stage_id),
+                        stage_name=stage_name,
+                        date_start_actual=sqlite_start,
+                        date_end_actual=sqlite_end,
+                    )
+            except Exception as mirror_err:
+                logger.warning(
+                    f"Task progress: SQLite mirror failed for {task_etap}/{task_zadacha}: {mirror_err}"
+                )
 
     except Exception as e:
         logger.error(f"Task progress update failed [{task_etap}/{task_zadacha}]: {e}", exc_info=True)
@@ -1200,6 +1215,7 @@ async def api_buyer_report_legacy(request: Request) -> JSONResponse:
 
 @app.post("/api/purchase-request")
 async def api_purchase_request(
+    background: BackgroundTasks,
     project_id: int = Form(...),
     items_json: str = Form(...),
     proposal: UploadFile = File(...),
@@ -1265,8 +1281,8 @@ async def api_purchase_request(
 
     project_name = f"Проект #{project_id}"
     try:
-        async with BitrixClient() as client:
-            for p in await workgroups.list_projects(client):
+        async with get_db() as db_conn:
+            for p in await repo.get_projects(db_conn):
                 if int(p["id"]) == project_id:
                     project_name = p.get("name", project_name)
                     break
@@ -1287,6 +1303,11 @@ async def api_purchase_request(
             buyer_comment=buyer_comment.strip(),
         )
 
+    audit_inputs = result.get("_audit_task_inputs")
+    if audit_inputs:
+        from app.purchase_requests import create_audit_task_background
+        background.add_task(create_audit_task_background, audit_inputs)
+
     return JSONResponse(content={
         "success": True,
         "request_id": result["request_id"],
@@ -1295,15 +1316,231 @@ async def api_purchase_request(
     })
 
 
+async def _sync_task_entry_to_bitrix(project_id: int, task_entry: dict) -> None:
+    """Push one task_entry's materials/labor/equipment deltas to Bitrix lists.
+
+    SQLite has already been updated synchronously by api_report; this function
+    only mirrors to Bitrix. Errors are logged but never raised.
+    """
+    task_etap    = task_entry.get("task_etap", "").strip()
+    task_zadacha = task_entry.get("task_zadacha", "").strip()
+    materials    = task_entry.get("materials", [])
+    labor        = task_entry.get("labor", [])
+    equipment    = task_entry.get("equipment", [])
+
+    if materials:
+        try:
+            async with BitrixClient() as client:
+                ctx = await _get_list_context(client, project_id, "материал")
+                if ctx:
+                    mat_list_id, mat_iblock, mat_field_map, mat_elements = ctx
+                    pid_qty_spent = next(
+                        (pid for fname, pid in mat_field_map.items() if "израсходовано" in fname.lower()),
+                        None,
+                    )
+                    pid_cost_spent = next(
+                        (pid for fname, pid in mat_field_map.items() if "стоим" in fname.lower() and "факт" in fname.lower()),
+                        None,
+                    )
+                    pid_stock = next(
+                        (pid for fname, pid in mat_field_map.items() if "остаток" in fname.lower()),
+                        None,
+                    )
+                    pid_price_fact = next(
+                        (pid for fname, pid in mat_field_map.items() if "цена ед" in fname.lower() and "факт" in fname.lower()),
+                        None,
+                    )
+                    pid_price_plan = next(
+                        (pid for fname, pid in mat_field_map.items() if "цена ед" in fname.lower() and "план" in fname.lower()),
+                        None,
+                    )
+                    for mat in materials:
+                        mat_name = mat.get("name", "").strip()
+                        qty_used = float(mat.get("quantity") or 0)
+                        if not mat_name or qty_used == 0:
+                            continue
+                        if task_etap and task_zadacha:
+                            matched = lists.find_elements_by_properties(
+                                mat_elements, mat_field_map,
+                                {"Этап": task_etap, "Задача": task_zadacha},
+                            )
+                            elem = lists.find_element_by_name(matched, mat_name)
+                        else:
+                            elem = lists.find_element_by_name(mat_elements, mat_name)
+                        if not elem:
+                            logger.warning(f"BG report sync: material '{mat_name}' not found in project {project_id}")
+                            continue
+                        element_id_mat = int(elem["ID"])
+                        new_vals: Dict[int, Any] = lists.extract_all_prop_values(elem)
+                        if pid_qty_spent:
+                            cur = lists.get_prop_value(elem, pid_qty_spent) or 0.0
+                            new_vals[pid_qty_spent] = cur + qty_used
+                        if pid_stock:
+                            cur = lists.get_prop_value(elem, pid_stock) or 0.0
+                            new_vals[pid_stock] = max(0.0, cur - qty_used)
+                        if pid_cost_spent:
+                            price = (
+                                (lists.get_prop_value(elem, pid_price_fact) if pid_price_fact else None)
+                                or (lists.get_prop_value(elem, pid_price_plan) if pid_price_plan else None)
+                                or 0.0
+                            )
+                            cur = lists.get_prop_value(elem, pid_cost_spent) or 0.0
+                            new_vals[pid_cost_spent] = cur + qty_used * price
+                        if new_vals:
+                            await lists.update_element(client, mat_list_id, mat_iblock, project_id, element_id_mat, new_vals, name=mat_name)
+                            logger.info(f"BG report sync: updated material '{mat_name}' [{task_etap}/{task_zadacha}]")
+        except Exception as sync_err:
+            logger.error(f"BG report sync (materials) failed for project {project_id}: {sync_err}", exc_info=True)
+
+    if labor:
+        try:
+            async with BitrixClient() as client:
+                ctx = await _get_list_context(client, project_id, "трудозатрат")
+                if ctx:
+                    lab_list_id, lab_iblock, lab_field_map, lab_elements = ctx
+                    pid_hours_fact = next(
+                        (pid for fname, pid in lab_field_map.items() if "факт" in fname.lower() and "час" in fname.lower()),
+                        None,
+                    )
+                    pid_rate = next(
+                        (pid for fname, pid in lab_field_map.items() if "ставка" in fname.lower()),
+                        None,
+                    )
+                    pid_fot_fact = next(
+                        (pid for fname, pid in lab_field_map.items() if "фот" in fname.lower() and "факт" in fname.lower()),
+                        None,
+                    )
+                    for worker in labor:
+                        worker_name = worker.get("worker_name", "").strip()
+                        hours = float(worker.get("hours") or 0)
+                        if not worker_name or hours == 0:
+                            continue
+                        if task_etap and task_zadacha:
+                            matched = lists.find_elements_by_properties(
+                                lab_elements, lab_field_map,
+                                {"Этап": task_etap, "Задача": task_zadacha},
+                            )
+                            elem = lists.find_element_by_name(matched, worker_name)
+                        else:
+                            elem = lists.find_element_by_name(lab_elements, worker_name)
+                        if not elem:
+                            logger.warning(f"BG report sync: worker '{worker_name}' not found in project {project_id}")
+                            continue
+                        element_id_lab = int(elem["ID"])
+                        new_vals_lab: Dict[int, Any] = lists.extract_all_prop_values(elem)
+                        if pid_hours_fact:
+                            cur = lists.get_prop_value(elem, pid_hours_fact) or 0.0
+                            total_hours = cur + hours
+                            new_vals_lab[pid_hours_fact] = total_hours
+                            if pid_fot_fact and pid_rate:
+                                rate = lists.get_prop_value(elem, pid_rate) or 0.0
+                                new_vals_lab[pid_fot_fact] = round(total_hours * rate, 2)
+                        if new_vals_lab:
+                            await lists.update_element(client, lab_list_id, lab_iblock, project_id, element_id_lab, new_vals_lab, name=worker_name)
+                            logger.info(f"BG report sync: updated labor '{worker_name}' [{task_etap}/{task_zadacha}]")
+        except Exception as sync_err:
+            logger.error(f"BG report sync (labor) failed for project {project_id}: {sync_err}", exc_info=True)
+
+    if equipment:
+        try:
+            async with BitrixClient() as client:
+                ctx = await _get_list_context(client, project_id, "техник")
+                if ctx:
+                    eq_list_id, eq_iblock, eq_field_map, eq_elements = ctx
+                    pid_hours_fact_eq = next(
+                        (pid for fname, pid in eq_field_map.items() if "факт" in fname.lower() and "час" in fname.lower()),
+                        None,
+                    )
+                    pid_price_hour = next(
+                        (pid for fname, pid in eq_field_map.items() if "цена" in fname.lower() and "час" in fname.lower()),
+                        None,
+                    )
+                    pid_total_fact = next(
+                        (pid for fname, pid in eq_field_map.items() if "итого" in fname.lower() and "факт" in fname.lower()),
+                        None,
+                    )
+                    for eq in equipment:
+                        eq_name = eq.get("name", "").strip()
+                        hours = float(eq.get("hours") or 0)
+                        if not eq_name or hours == 0:
+                            continue
+                        if task_etap and task_zadacha:
+                            matched = lists.find_elements_by_properties(
+                                eq_elements, eq_field_map,
+                                {"Этап": task_etap, "Задача": task_zadacha},
+                            )
+                            elem = lists.find_element_by_name(matched, eq_name)
+                        else:
+                            elem = lists.find_element_by_name(eq_elements, eq_name)
+                        if not elem:
+                            logger.warning(f"BG report sync: equipment '{eq_name}' not found in project {project_id}")
+                            continue
+                        element_id_eq = int(elem["ID"])
+                        new_vals_eq: Dict[int, Any] = lists.extract_all_prop_values(elem)
+                        if pid_hours_fact_eq:
+                            cur = lists.get_prop_value(elem, pid_hours_fact_eq) or 0.0
+                            total_hours = cur + hours
+                            new_vals_eq[pid_hours_fact_eq] = total_hours
+                            if pid_total_fact and pid_price_hour:
+                                qty = lists.get_prop_value(elem, lists._resolve_filter_pid(eq_field_map, "кол-во") or 0) or 1.0
+                                price = lists.get_prop_value(elem, pid_price_hour) or 0.0
+                                new_vals_eq[pid_total_fact] = round(qty * price * total_hours, 2)
+                        if new_vals_eq:
+                            await lists.update_element(client, eq_list_id, eq_iblock, project_id, element_id_eq, new_vals_eq, name=eq_name)
+                            logger.info(f"BG report sync: updated equipment '{eq_name}' [{task_etap}/{task_zadacha}]")
+        except Exception as sync_err:
+            logger.error(f"BG report sync (equipment) failed for project {project_id}: {sync_err}", exc_info=True)
+
+
 async def _background_report_tasks(
     project_id: int,
     tasks_entries: list,
     report_project_name: str,
+    report_date: str,
+    comments: str,
 ) -> None:
     """
-    Heavy post-report work: cascade updates, task progress, and notifications.
-    Runs in the background so the HTTP response is returned immediately.
+    All Bitrix-side work for a foreman report: create the report list element,
+    sync materials/labor/equipment to Bitrix lists, run cascade, update task
+    progress, run notifications. Runs after the HTTP 200 has been returned.
+
+    SQLite is already updated synchronously in api_report — this function does
+    not write to SQLite (Bitrix is the display mirror).
     """
+    # 1. Create the Bitrix report list element
+    try:
+        async with BitrixClient() as client:
+            report_info = await lists.get_or_create_report_list(client, project_id)
+            list_id = report_info["list_id"]
+            iblock_code = report_info["iblock_code"]
+            field_ids = report_info["field_ids"]
+            field_values: dict[int, str] = {}
+            if "f_0_date" in field_ids:
+                field_values[field_ids["f_0_date"]] = report_date
+            if "f_1_author" in field_ids:
+                field_values[field_ids["f_1_author"]] = "Прораб"
+            if "f_2_comments" in field_ids:
+                field_values[field_ids["f_2_comments"]] = comments
+            if "f_3_materials" in field_ids:
+                all_mats = [m for t in tasks_entries for m in t.get("materials", [])]
+                field_values[field_ids["f_3_materials"]] = json.dumps(all_mats, ensure_ascii=False)
+            if "f_4_labor" in field_ids:
+                all_lab = [l for t in tasks_entries for l in t.get("labor", [])]
+                field_values[field_ids["f_4_labor"]] = json.dumps(all_lab, ensure_ascii=False)
+            element_code = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            await lists.add_element(
+                client, list_id=list_id, iblock_code=iblock_code,
+                group_id=project_id, element_code=element_code,
+                name=f"Отчет {report_date}", field_values=field_values,
+            )
+    except Exception as e:
+        logger.error(f"BG report-element create failed for project {project_id}: {e}", exc_info=True)
+
+    # 2. Bitrix material/labor/equipment sync per task entry
+    for task_entry in tasks_entries:
+        await _sync_task_entry_to_bitrix(project_id, task_entry)
+
+    # 3. Cascade + task progress + notifications (existing logic)
     for task_entry in tasks_entries:
         task_etap      = task_entry.get("task_etap", "").strip()
         task_zadacha   = task_entry.get("task_zadacha", "").strip()
@@ -1437,7 +1674,12 @@ async def _background_report_tasks(
 async def api_report(request: Request, background: BackgroundTasks) -> JSONResponse:
     """
     Submit a foreman daily report.
-    Creates a report element, syncs materials/labor/equipment, and cascades to tasks/budget.
+
+    Synchronous path: validate, write deltas to SQLite, run SQLite cascade.
+    Background path: create Bitrix report element, mirror to Bitrix lists,
+    run Bitrix cascade, update task progress, run notifications.
+
+    SQLite is the source of truth for the response — Bitrix is an async mirror.
     """
     body = await request.json()
 
@@ -1448,7 +1690,6 @@ async def api_report(request: Request, background: BackgroundTasks) -> JSONRespo
     # Support both new multi-task format (tasks=[]) and legacy flat format
     tasks_entries = body.get("tasks", [])
     if not tasks_entries:
-        # Legacy fallback: single task with flat materials/labor/equipment
         tasks_entries = [{
             "task_etap": body.get("task_etap", "").strip(),
             "task_zadacha": body.get("task_zadacha", "").strip(),
@@ -1462,273 +1703,104 @@ async def api_report(request: Request, background: BackgroundTasks) -> JSONRespo
 
     project_id = int(project_id)
 
+    # --- Synchronous: SQLite writes only ---
+    report_project_name = f"Проект #{project_id}"
     try:
-        async with BitrixClient() as client:
-            # Get or create the report list
-            report_info = await lists.get_or_create_report_list(client, project_id)
-            list_id = report_info["list_id"]
-            iblock_code = report_info["iblock_code"]
-            field_ids = report_info["field_ids"]
+        async with get_db() as db_conn:
+            projects_rows = await repo.get_projects(db_conn)
+            for p in projects_rows:
+                if int(p["id"]) == project_id:
+                    report_project_name = p.get("name", report_project_name)
+                    break
 
-            # Build field values
-            field_values: dict[int, str] = {}
-            if "f_0_date" in field_ids:
-                field_values[field_ids["f_0_date"]] = report_date
-            if "f_1_author" in field_ids:
-                field_values[field_ids["f_1_author"]] = "Прораб"  # MVP: no user context
-            if "f_2_comments" in field_ids:
-                field_values[field_ids["f_2_comments"]] = comments
-            if "f_3_materials" in field_ids:
-                all_mats = [m for t in tasks_entries for m in t.get("materials", [])]
-                field_values[field_ids["f_3_materials"]] = json.dumps(all_mats, ensure_ascii=False)
-            if "f_4_labor" in field_ids:
-                all_lab = [l for t in tasks_entries for l in t.get("labor", [])]
-                field_values[field_ids["f_4_labor"]] = json.dumps(all_lab, ensure_ascii=False)
+            cascade_pairs: set[tuple[str, str]] = set()
+            cascade_phases: set[str] = set()
 
-            element_code = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            for task_entry in tasks_entries:
+                task_etap    = task_entry.get("task_etap", "").strip()
+                task_zadacha = task_entry.get("task_zadacha", "").strip()
+                materials    = task_entry.get("materials", [])
+                labor        = task_entry.get("labor", [])
+                equipment    = task_entry.get("equipment", [])
 
-            element_id = await lists.add_element(
-                client,
-                list_id=list_id,
-                iblock_code=iblock_code,
-                group_id=project_id,
-                element_code=element_code,
-                name=f"Отчет {report_date}",
-                field_values=field_values,
-            )
+                if task_etap and task_zadacha:
+                    cascade_pairs.add((task_etap, task_zadacha))
+                    cascade_phases.add(task_etap)
 
+                for mat in materials:
+                    mat_name = (mat.get("name") or "").strip()
+                    qty_used = float(mat.get("quantity") or 0)
+                    if not mat_name or qty_used == 0:
+                        continue
+                    plan_row = await repo.get_material_row(
+                        db_conn, project_id, task_etap, task_zadacha, mat_name,
+                    ) if task_etap and task_zadacha else None
+                    price = 0.0
+                    if plan_row:
+                        price = float(plan_row.get("price_actual") or 0.0) or float(plan_row.get("price_plan") or 0.0)
+                    cost_delta = qty_used * price
+                    await repo.update_material_after_report(
+                        db_conn, project_id, task_etap, task_zadacha, mat_name,
+                        qty_used, cost_delta,
+                    )
+
+                for worker in labor:
+                    worker_name = (worker.get("worker_name") or "").strip()
+                    hours = float(worker.get("hours") or 0)
+                    if not worker_name or hours == 0:
+                        continue
+                    plan_row = await repo.get_labor_row(
+                        db_conn, project_id, task_etap, task_zadacha, worker_name,
+                    ) if task_etap and task_zadacha else None
+                    rate = float(plan_row.get("rate") or 0.0) if plan_row else 0.0
+                    payroll_delta = hours * rate
+                    await repo.update_labor_after_report(
+                        db_conn, project_id, task_etap, task_zadacha, worker_name,
+                        hours, payroll_delta,
+                    )
+
+                for eq in equipment:
+                    eq_name = (eq.get("name") or "").strip()
+                    hours = float(eq.get("hours") or 0)
+                    if not eq_name or hours == 0:
+                        continue
+                    plan_row = await repo.get_equipment_row(
+                        db_conn, project_id, task_etap, task_zadacha, eq_name,
+                    ) if task_etap and task_zadacha else None
+                    price_per_hour = float(plan_row.get("price_per_hour") or 0.0) if plan_row else 0.0
+                    total_delta = hours * price_per_hour
+                    await repo.update_equipment_after_report(
+                        db_conn, project_id, task_etap, task_zadacha, eq_name,
+                        hours, total_delta,
+                    )
+
+            # SQLite cascade: per-task budgets, then per-phase budgets
+            for etap, zadacha in cascade_pairs:
+                try:
+                    await repo.cascade_task_budget(db_conn, project_id, etap, zadacha)
+                except Exception as e:
+                    logger.warning(f"SQLite cascade_task_budget [{etap}/{zadacha}] failed: {e}")
+            for etap in cascade_phases:
+                try:
+                    await repo.cascade_phase_budget(db_conn, project_id, etap)
+                except Exception as e:
+                    logger.warning(f"SQLite cascade_phase_budget [{etap}] failed: {e}")
     except Exception as e:
-        logger.error(f"Report creation failed for project {project_id}: {e}", exc_info=True)
+        logger.error(f"Report SQLite write failed for project {project_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-    logger.info(f"Report created: element_id={element_id} for project {project_id}")
+    logger.info(f"Report SQLite write complete for project {project_id}")
 
-    # Resolve project name for notifications
-    _report_project_name = f"Проект #{project_id}"
-    try:
-        async with BitrixClient() as client:
-            _all_projects = await workgroups.list_projects(client)
-            for _p in _all_projects:
-                if int(_p["id"]) == project_id:
-                    _report_project_name = _p.get("name", _report_project_name)
-                    break
-    except Exception:
-        pass
-
-    # --- Sync each task entry's materials/labor/equipment (fast, synchronous) ---
-    for task_entry in tasks_entries:
-        task_etap    = task_entry.get("task_etap", "").strip()
-        task_zadacha = task_entry.get("task_zadacha", "").strip()
-        materials    = task_entry.get("materials", [])
-        labor        = task_entry.get("labor", [])
-        equipment    = task_entry.get("equipment", [])
-
-        # Sync materials into "3. Материалы"
-        if materials:
-            try:
-                async with BitrixClient() as client:
-                    ctx = await _get_list_context(client, project_id, "материал")
-                    if ctx:
-                        mat_list_id, mat_iblock, mat_field_map, mat_elements = ctx
-
-                        pid_qty_spent = next(
-                            (pid for fname, pid in mat_field_map.items() if "израсходовано" in fname.lower()),
-                            None,
-                        )
-                        pid_cost_spent = next(
-                            (pid for fname, pid in mat_field_map.items() if "стоим" in fname.lower() and "факт" in fname.lower()),
-                            None,
-                        )
-                        pid_stock = next(
-                            (pid for fname, pid in mat_field_map.items() if "остаток" in fname.lower()),
-                            None,
-                        )
-                        pid_price_fact = next(
-                            (pid for fname, pid in mat_field_map.items() if "цена ед" in fname.lower() and "факт" in fname.lower()),
-                            None,
-                        )
-                        pid_price_plan = next(
-                            (pid for fname, pid in mat_field_map.items() if "цена ед" in fname.lower() and "план" in fname.lower()),
-                            None,
-                        )
-
-                        for mat in materials:
-                            mat_name = mat.get("name", "").strip()
-                            qty_used = float(mat.get("quantity") or 0)
-                            if not mat_name or qty_used == 0:
-                                continue
-
-                            if task_etap and task_zadacha:
-                                matched = lists.find_elements_by_properties(
-                                    mat_elements, mat_field_map,
-                                    {"Этап": task_etap, "Задача": task_zadacha},
-                                )
-                                elem = lists.find_element_by_name(matched, mat_name)
-                            else:
-                                elem = lists.find_element_by_name(mat_elements, mat_name)
-
-                            if not elem:
-                                logger.warning(f"Report sync: material '{mat_name}' not found in project {project_id}")
-                                continue
-                            element_id_mat = int(elem["ID"])
-
-                            new_vals: Dict[int, Any] = lists.extract_all_prop_values(elem)
-
-                            if pid_qty_spent:
-                                cur = lists.get_prop_value(elem, pid_qty_spent) or 0.0
-                                new_vals[pid_qty_spent] = cur + qty_used
-
-                            if pid_stock:
-                                cur = lists.get_prop_value(elem, pid_stock) or 0.0
-                                new_vals[pid_stock] = max(0.0, cur - qty_used)
-
-                            if pid_cost_spent:
-                                price = (
-                                    (lists.get_prop_value(elem, pid_price_fact) if pid_price_fact else None)
-                                    or (lists.get_prop_value(elem, pid_price_plan) if pid_price_plan else None)
-                                    or 0.0
-                                )
-                                cur = lists.get_prop_value(elem, pid_cost_spent) or 0.0
-                                new_vals[pid_cost_spent] = cur + qty_used * price
-
-                            if new_vals:
-                                await lists.update_element(client, mat_list_id, mat_iblock, project_id, element_id_mat, new_vals, name=mat_name)
-                                logger.info(f"Report sync: updated material '{mat_name}' [{task_etap}/{task_zadacha}]")
-            except Exception as sync_err:
-                logger.error(f"Report sync (materials) failed for project {project_id}: {sync_err}", exc_info=True)
-
-        # Sync labor into "4. Трудозатраты"
-        if labor:
-            try:
-                async with BitrixClient() as client:
-                    ctx = await _get_list_context(client, project_id, "трудозатрат")
-                    if ctx:
-                        lab_list_id, lab_iblock, lab_field_map, lab_elements = ctx
-
-                        pid_hours_fact = next(
-                            (pid for fname, pid in lab_field_map.items() if "факт" in fname.lower() and "час" in fname.lower()),
-                            None,
-                        )
-                        pid_rate = next(
-                            (pid for fname, pid in lab_field_map.items() if "ставка" in fname.lower()),
-                            None,
-                        )
-                        pid_fot_fact = next(
-                            (pid for fname, pid in lab_field_map.items() if "фот" in fname.lower() and "факт" in fname.lower()),
-                            None,
-                        )
-
-                        for worker in labor:
-                            worker_name = worker.get("worker_name", "").strip()
-                            hours = float(worker.get("hours") or 0)
-                            if not worker_name or hours == 0:
-                                continue
-
-                            if task_etap and task_zadacha:
-                                matched = lists.find_elements_by_properties(
-                                    lab_elements, lab_field_map,
-                                    {"Этап": task_etap, "Задача": task_zadacha},
-                                )
-                                elem = lists.find_element_by_name(matched, worker_name)
-                            else:
-                                elem = lists.find_element_by_name(lab_elements, worker_name)
-
-                            if not elem:
-                                logger.warning(f"Report sync: worker '{worker_name}' not found in project {project_id}")
-                                continue
-                            element_id_lab = int(elem["ID"])
-
-                            new_vals_lab: Dict[int, Any] = lists.extract_all_prop_values(elem)
-
-                            if pid_hours_fact:
-                                cur = lists.get_prop_value(elem, pid_hours_fact) or 0.0
-                                total_hours = cur + hours
-                                new_vals_lab[pid_hours_fact] = total_hours
-
-                                if pid_fot_fact and pid_rate:
-                                    rate = lists.get_prop_value(elem, pid_rate) or 0.0
-                                    new_vals_lab[pid_fot_fact] = round(total_hours * rate, 2)
-
-                            if new_vals_lab:
-                                await lists.update_element(client, lab_list_id, lab_iblock, project_id, element_id_lab, new_vals_lab, name=worker_name)
-                                logger.info(f"Report sync: updated labor '{worker_name}' [{task_etap}/{task_zadacha}]")
-            except Exception as sync_err:
-                logger.error(f"Report sync (labor) failed for project {project_id}: {sync_err}", exc_info=True)
-
-        # Sync equipment into "5. Техника"
-        if equipment:
-            try:
-                async with BitrixClient() as client:
-                    ctx = await _get_list_context(client, project_id, "техник")
-                    if ctx:
-                        eq_list_id, eq_iblock, eq_field_map, eq_elements = ctx
-
-                        pid_hours_fact_eq = next(
-                            (pid for fname, pid in eq_field_map.items() if "факт" in fname.lower() and "час" in fname.lower()),
-                            None,
-                        )
-                        pid_price_hour = next(
-                            (pid for fname, pid in eq_field_map.items() if "цена" in fname.lower() and "час" in fname.lower()),
-                            None,
-                        )
-                        pid_total_fact = next(
-                            (pid for fname, pid in eq_field_map.items() if "итого" in fname.lower() and "факт" in fname.lower()),
-                            None,
-                        )
-
-                        for eq in equipment:
-                            eq_name = eq.get("name", "").strip()
-                            hours = float(eq.get("hours") or 0)
-                            if not eq_name or hours == 0:
-                                continue
-
-                            if task_etap and task_zadacha:
-                                matched = lists.find_elements_by_properties(
-                                    eq_elements, eq_field_map,
-                                    {"Этап": task_etap, "Задача": task_zadacha},
-                                )
-                                elem = lists.find_element_by_name(matched, eq_name)
-                            else:
-                                elem = lists.find_element_by_name(eq_elements, eq_name)
-
-                            if not elem:
-                                logger.warning(f"Report sync: equipment '{eq_name}' not found in project {project_id}")
-                                continue
-                            element_id_eq = int(elem["ID"])
-
-                            new_vals_eq: Dict[int, Any] = lists.extract_all_prop_values(elem)
-
-                            if pid_hours_fact_eq:
-                                cur = lists.get_prop_value(elem, pid_hours_fact_eq) or 0.0
-                                total_hours = cur + hours
-                                new_vals_eq[pid_hours_fact_eq] = total_hours
-
-                                if pid_total_fact and pid_price_hour:
-                                    qty = lists.get_prop_value(elem, lists._resolve_filter_pid(eq_field_map, "кол-во") or 0) or 1.0
-                                    price = lists.get_prop_value(elem, pid_price_hour) or 0.0
-                                    new_vals_eq[pid_total_fact] = round(qty * price * total_hours, 2)
-
-                            if new_vals_eq:
-                                await lists.update_element(client, eq_list_id, eq_iblock, project_id, element_id_eq, new_vals_eq, name=eq_name)
-                                logger.info(f"Report sync: updated equipment '{eq_name}' [{task_etap}/{task_zadacha}]")
-            except Exception as sync_err:
-                logger.error(f"Report sync (equipment) failed for project {project_id}: {sync_err}", exc_info=True)
-
-        # Cascade, task progress, and notifications run in the background
-        # so the HTTP response is returned without waiting for them.
-        # (These account for ~35 extra sequential API calls.)
-
-    # Schedule cascade + task progress + notifications as background work
+    # --- Background: Bitrix mirror + cascade + notifications ---
     background.add_task(
         _background_report_tasks,
-        project_id,
-        tasks_entries,
-        _report_project_name,
+        project_id, tasks_entries, report_project_name, report_date, comments,
     )
 
     domain = settings.bitrix24_domain
     return JSONResponse(content={
         "success": True,
-        "element_id": element_id,
         "link": f"https://{domain}/workgroups/group/{project_id}/lists/",
     })
+
+

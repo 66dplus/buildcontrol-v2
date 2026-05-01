@@ -23,7 +23,20 @@ tasks(project_id, phase, task_name,
   budget_actual  — фактические затраты в ₽ (каскад: сумма из materials + labor + equipment)
   date_*_plan    — плановые даты в формате YYYY-MM-DD (ISO 8601, совместимо с date('now'))
   date_*_actual  — фактические даты (NULL если не начато / не завершено)
-  stage_name     — текущая стадия Kanban («Новая», «В работе», «Завершена» и т.д.)
+  stage_name     — текущая стадия Kanban. Терминальные значения зафиксированы:
+                   «Новая» (первая колонка) и «Завершена» (последняя). Промежуточные
+                   стадии — это пользовательские названия из Bitrix («Выполняются»,
+                   «В работе», «В процессе», «На проверке» и т.п.) — НЕ хардкодить их.
+                   Для «задачи в работе» используй ОТРИЦАНИЕ:
+                       stage_name NOT IN ('Новая', 'Завершена') AND stage_name IS NOT NULL
+                   ВНИМАНИЕ: для части задач stage_name может быть NULL (нет
+                   bitrix_task_id или канбан ещё не двигали). Если stage_name IS NULL,
+                   страхуйся мягкими сигналами: «в работе» = completion_pct > 0 AND
+                   completion_pct < 100, ИЛИ date_start_actual IS NOT NULL AND
+                   date_start_actual <> '' AND (date_end_actual IS NULL OR
+                   date_end_actual = '').
+                   Не пиши «нет задач в работе» только потому, что stage_name пустой —
+                   проверь обе ветки.
 
 materials(project_id, phase, task_name, material_name, unit,
           price_plan, qty_plan, cost_plan,
@@ -75,6 +88,24 @@ purchase_requests(id, project_id, status, items_json, buyer_comment,
   items_json — JSON-массив позиций: [{material_name, unit, qty, price, price_plan}, ...]
   actor      — кто принял решение (имя согласующего)
 
+  ВАЖНО: «перерасход цены» ≠ «статус rejected».
+  rejected = согласующий вручную отказал. Это НЕ признак перерасхода цены.
+  Перерасход = price > price_plan хотя бы для одной позиции в items_json, НЕЗАВИСИМО от статуса.
+  Одобренная заявка может содержать перерасход (директор принял решение осознанно).
+  Для вопросов «Есть перерасход в закупках?» проверяй ВСЕ ТРИ источника:
+    а) purchase_requests.items_json — цена позиции закупки vs плановая цена
+    б) materials.price_actual vs materials.price_plan — средневзвешенная цена по материалам
+    в) materials: qty_consumed/qty_plan >> AVG(task completion_pct) + 15% — мягкий сигнал темпа
+
+  ВАЖНО: любое превышение price > price_plan считается перерасходом — даже 0.1%.
+  НЕ округляй и не сглаживай разницу до нуля, не пиши «незначительное отклонение».
+
+  ФОРМАТ ответа при перерасходе (обязателен):
+  «По цене есть перерасход: {overspend_rub} ₽.
+   В запланированном бюджете стоимость составляет {plan_total} ₽,
+   а закупка идёт на {actual_total} ₽ (+{dev_pct}%).»
+  Всегда указывай ИТОГОВЫЕ суммы (qty × price), а не цены за единицу.
+
 === ВАЖНЫЕ ПРАВИЛА ДЛЯ SQL ===
 
 1. КИРИЛЛИЦА LIKE — Встроенный LOWER() в SQLite НЕ работает для кириллицы.
@@ -124,6 +155,20 @@ FROM budget_phases bp
 JOIN projects p ON p.id = bp.project_id
 WHERE py_lower(p.name) LIKE '%питер%';
 
+-- Задачи в работе (исключаем терминальные стадии + страховка по NULL stage_name):
+SELECT t.phase, t.task_name, t.stage_name, t.completion_pct,
+       t.date_start_actual, t.date_end_plan
+FROM tasks t
+JOIN projects p ON p.id = t.project_id
+WHERE py_lower(p.name) LIKE '%питер%'
+  AND (
+        (t.stage_name IS NOT NULL AND t.stage_name NOT IN ('Новая', 'Завершена'))
+     OR (t.stage_name IS NULL AND t.completion_pct > 0 AND t.completion_pct < 100)
+     OR (t.stage_name IS NULL AND t.date_start_actual IS NOT NULL AND t.date_start_actual <> ''
+                              AND (t.date_end_actual IS NULL OR t.date_end_actual = ''))
+  )
+ORDER BY t.date_end_plan;
+
 -- Просроченные задачи:
 SELECT t.phase, t.task_name, t.date_end_plan, t.completion_pct
 FROM tasks t
@@ -145,4 +190,63 @@ SELECT pr.id, p.name AS project, pr.created_at, pr.items_json
 FROM purchase_requests pr
 JOIN projects p ON p.id = pr.project_id
 WHERE pr.status = 'pending';
+
+-- Позиции закупок с перерасходом цены (price > price_plan в items_json):
+SELECT pr.id, pr.status, p.name AS project, pr.created_at,
+       ji.value->>'material_name'                                                    AS material,
+       ROUND(CAST(ji.value->>'qty'        AS REAL), 2)                              AS qty,
+       ROUND(CAST(ji.value->>'price'      AS REAL), 2)                              AS price_actual,
+       ROUND(CAST(ji.value->>'price_plan' AS REAL), 2)                              AS price_plan,
+       ROUND((CAST(ji.value->>'price' AS REAL) - CAST(ji.value->>'price_plan' AS REAL))
+             / CAST(ji.value->>'price_plan' AS REAL) * 100, 1)                      AS dev_pct,
+       ROUND((CAST(ji.value->>'price' AS REAL) - CAST(ji.value->>'price_plan' AS REAL))
+             * CAST(ji.value->>'qty' AS REAL))                                       AS overspend_rub
+FROM purchase_requests pr
+JOIN projects p ON p.id = pr.project_id
+JOIN json_each(pr.items_json) ji
+WHERE py_lower(p.name) LIKE '%питер%'
+  AND CAST(ji.value->>'price_plan' AS REAL) > 0
+  AND CAST(ji.value->>'price'      AS REAL) > CAST(ji.value->>'price_plan' AS REAL)
+ORDER BY dev_pct DESC;
+
+-- Отклонение средней цены закупки от плановой (из таблицы materials):
+SELECT m.material_name, m.unit,
+       SUM(m.qty_bought)                                                            AS qty_bought,
+       ROUND(AVG(CASE WHEN m.price_plan   > 0 THEN m.price_plan   END), 2)         AS price_plan,
+       ROUND(AVG(CASE WHEN m.price_actual > 0 THEN m.price_actual END), 2)         AS price_actual,
+       ROUND((AVG(CASE WHEN m.price_actual > 0 THEN m.price_actual END) -
+              AVG(CASE WHEN m.price_plan   > 0 THEN m.price_plan   END))
+             / NULLIF(AVG(CASE WHEN m.price_plan > 0 THEN m.price_plan END), 0)
+             * 100, 1)                                                              AS dev_pct,
+       ROUND((AVG(CASE WHEN m.price_actual > 0 THEN m.price_actual END) -
+              AVG(CASE WHEN m.price_plan   > 0 THEN m.price_plan   END))
+             * SUM(m.qty_bought))                                                   AS overspend_rub
+FROM materials m
+JOIN projects p ON p.id = m.project_id
+WHERE py_lower(p.name) LIKE '%питер%'
+  AND m.price_plan > 0 AND m.price_actual > 0
+  AND m.price_actual > m.price_plan
+GROUP BY m.material_name, m.unit
+ORDER BY dev_pct DESC;
+
+-- Мягкий сигнал: материал расходуется быстрее, чем выполняются задачи (порог +15%):
+SELECT m.material_name, m.unit,
+       ROUND(SUM(m.qty_plan), 2)                                                     AS qty_plan,
+       ROUND(SUM(m.qty_consumed), 2)                                                 AS qty_consumed,
+       ROUND(SUM(m.qty_consumed) * 100.0 / NULLIF(SUM(m.qty_plan), 0), 1)           AS consumed_pct,
+       ROUND(AVG(t.completion_pct), 1)                                               AS task_done_pct,
+       COUNT(DISTINCT t.task_name)                                                   AS tasks_total,
+       COUNT(DISTINCT CASE WHEN t.completion_pct < 100 THEN t.task_name END)         AS tasks_remaining,
+       COUNT(DISTINCT CASE WHEN t.stage_name NOT IN ('Новая', 'Завершена')
+             THEN t.task_name END)                                                   AS tasks_active
+FROM materials m
+JOIN tasks t ON t.project_id = m.project_id
+           AND t.phase = m.phase
+           AND t.task_name = m.task_name
+JOIN projects p ON p.id = m.project_id
+WHERE py_lower(p.name) LIKE '%питер%'
+  AND m.qty_plan > 0
+GROUP BY m.material_name, m.unit
+HAVING consumed_pct > task_done_pct + 15
+ORDER BY (consumed_pct - task_done_pct) DESC;
 """

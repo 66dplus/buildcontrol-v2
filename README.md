@@ -261,22 +261,22 @@ uvicorn app.webhook_handler:app --reload --port 8000
 
 ## VPS & Deploy
 
-- **Server:** `162.120.19.127`, app at `/opt/buildcontrol/`, Python venv at `venv/`
+- **Server:** `<YOUR_VPS_IP>`, app at `/opt/buildcontrol/`, Python venv at `venv/`
 - **Service:** `systemd` unit `buildcontrol` (uvicorn on port 8000, not exposed directly)
 - **Public HTTPS:** Cloudflare Tunnel → temporary `*.trycloudflare.com` URL (changes on restart)
 
 Deploy = rsync + **mandatory service restart** (uvicorn does not hot-reload Python modules):
 
 ```bash
-cd "/Users/dmitrijrybkin/Documents/Claude Code/BuildControl_v2"
+cd "<project_dir>"
 
-SSHPASS='<password>' sshpass -e /usr/bin/rsync -avz \
+SSHPASS='<your_vps_password>' sshpass -e /usr/bin/rsync -avz \
   --exclude='.env' --exclude='__pycache__' --exclude='*.pyc' \
   --exclude='.git' --exclude='venv' --exclude='template_data' \
   -e "ssh -o StrictHostKeyChecking=no" \
-  ./ root@162.120.19.127:/opt/buildcontrol/
+  ./ root@<YOUR_VPS_IP>:/opt/buildcontrol/
 
-ssh root@162.120.19.127 "systemctl restart buildcontrol && systemctl status buildcontrol --no-pager"
+ssh root@<YOUR_VPS_IP> "systemctl restart buildcontrol && systemctl status buildcontrol --no-pager"
 ```
 
 See [prod_info.md](prod_info.md) for full ops details, Cloudflare tunnel setup, and troubleshooting.

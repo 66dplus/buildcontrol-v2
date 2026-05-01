@@ -7,7 +7,7 @@ never break because Telegram is unreachable.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 # Telegram Bot API base URL
 _TG_API = "https://api.telegram.org/bot{token}/sendMessage"
 _TG_ANSWER_CALLBACK = "https://api.telegram.org/bot{token}/answerCallbackQuery"
+_TG_EDIT_MESSAGE = "https://api.telegram.org/bot{token}/editMessageText"
+_TG_EDIT_REPLY_MARKUP = "https://api.telegram.org/bot{token}/editMessageReplyMarkup"
 
 # Telegram message limit is 4096 chars; we truncate to be safe
 _MAX_MESSAGE_LEN = 4000
@@ -122,6 +124,43 @@ async def send_telegram_with_buttons(
     except Exception as e:
         logger.error(f"Telegram send_with_buttons failed: {e}")
         return None
+
+
+async def edit_message_text(
+    chat_id: Union[int, str],
+    message_id: int,
+    text: str,
+    parse_mode: str = "HTML",
+    drop_buttons: bool = True,
+) -> bool:
+    """
+    Replace the text of a previously sent Telegram message in place.
+    By default also strips inline buttons so the resolved request can no longer
+    be acted on.
+    """
+    token = settings.telegram_bot_token
+    if not token:
+        return False
+    if len(text) > _MAX_MESSAGE_LEN:
+        text = text[:_MAX_MESSAGE_LEN - 20] + "\n... (обрезано)"
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+    }
+    if drop_buttons:
+        payload["reply_markup"] = {"inline_keyboard": []}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(_TG_EDIT_MESSAGE.format(token=token), json=payload)
+            if resp.status_code != 200:
+                logger.warning(f"Telegram editMessageText failed: {resp.status_code} — {resp.text}")
+                return False
+            return bool(resp.json().get("ok"))
+    except Exception as e:
+        logger.warning(f"Telegram edit_message_text exception: {e}")
+        return False
 
 
 async def answer_callback_query(

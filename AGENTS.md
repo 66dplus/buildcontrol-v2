@@ -121,7 +121,7 @@ Bitrix24 allows 2 req/sec per webhook. `bitrix/client.py` enforces:
 
 - Python 3.13 (local) / 3.12 on VPS — always use venv
 - Key env vars: `BITRIX24_WEBHOOK_URL`, `BITRIX24_DOMAIN`, `VPS_URL`, `VPS_PASSWORD`
-- VPS: `162.120.19.127`, app at `/opt/buildcontrol/`, venv at `/opt/buildcontrol/venv/`
+- VPS: `<YOUR_VPS_IP>`, app at `/opt/buildcontrol/`, venv at `/opt/buildcontrol/venv/`
 - Service: `systemd` unit `buildcontrol` (uvicorn on port 8000)
 - Public HTTPS: Cloudflare Tunnel (`cloudflared`) → temporary `*.trycloudflare.com` URL
 
@@ -133,22 +133,22 @@ Bitrix24 allows 2 req/sec per webhook. `bitrix/client.py` enforces:
 # Local dev
 pip install -r requirements.txt
 python -m pytest tests/ -v
-python scripts/import_excel.py template_data/plan_fact_v3.xlsx
+python scripts/import_excel.py template_data/plan_fact_v4.xlsx
 
 # Deploy to VPS (rsync + restart — BOTH steps required)
-cd "/Users/dmitrijrybkin/Documents/Codex/BuildControl_v2"
-SSHPASS='<password>' sshpass -e /usr/bin/rsync -avz \
+cd "<project_dir>"
+SSHPASS='<your_vps_password>' sshpass -e /usr/bin/rsync -avz \
   --exclude='.env' --exclude='__pycache__' --exclude='*.pyc' \
   --exclude='.git' --exclude='venv' --exclude='template_data' \
   -e "ssh -o StrictHostKeyChecking=no" \
-  ./ root@162.120.19.127:/opt/buildcontrol/
-ssh root@162.120.19.127 "systemctl restart buildcontrol && systemctl status buildcontrol --no-pager"
+  ./ root@<YOUR_VPS_IP>:/opt/buildcontrol/
+ssh root@<YOUR_VPS_IP> "systemctl restart buildcontrol && systemctl status buildcontrol --no-pager"
 
 # VPS diagnostics
-ssh root@162.120.19.127 "journalctl -u buildcontrol -n 100 --no-pager"
-curl http://162.120.19.127:8000/health
-curl "http://162.120.19.127:8000/api/projects/{ID}/tasks"
-curl "http://162.120.19.127:8000/api/projects/{ID}/materials?etap=X&zadacha=Y"
+ssh root@<YOUR_VPS_IP> "journalctl -u buildcontrol -n 100 --no-pager"
+curl http://<YOUR_VPS_IP>:8000/health
+curl "http://<YOUR_VPS_IP>:8000/api/projects/{ID}/tasks"
+curl "http://<YOUR_VPS_IP>:8000/api/projects/{ID}/materials?etap=X&zadacha=Y"
 ```
 
 ---

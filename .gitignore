@@ -38,3 +38,13 @@ env/
 # OS
 .DS_Store
 .env.local
+
+# Test / build caches
+.pytest_cache/
+pytest-of-*/
+node-compile-cache/
+.claude/scheduled_tasks.lock
+
+# Local ops files with credentials — never commit
+deploy.md
+.claude/settings.local.json

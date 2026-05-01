@@ -9,3 +9,4 @@ python-multipart==0.0.20
 python-telegram-bot==21.7
 apscheduler==3.10.4
 openai>=1.50.0
+aiosqlite>=0.20.0

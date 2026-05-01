@@ -10,7 +10,7 @@
 | Property | Value |
 |---|---|
 | Provider | Hostkey (hk) |
-| IP | `162.120.19.127` |
+| IP | `<YOUR_VPS_IP>` |
 | OS | Ubuntu 24.04.4 LTS |
 | RAM | 1.8 GB |
 | Disk | 58 GB (8.6 GB used) |
@@ -19,7 +19,7 @@
 ### SSH access
 
 ```bash
-ssh root@162.120.19.127
+ssh root@<YOUR_VPS_IP>
 # password stored in .env as VPS_PASSWORD
 ```
 
@@ -233,10 +233,10 @@ Use this whenever you push new code changes.
 ### Option A — one-liner from your Mac
 
 ```bash
-cd "/Users/dmitrijrybkin/Documents/Claude Code/BuildControl_v2"
+cd "<project_dir>"
 
 # 1. Copy files to server (skips .env, cache, git, venv)
-SSHPASS='<password>' sshpass -e /usr/bin/rsync -avz \
+SSHPASS='<your_vps_password>' sshpass -e /usr/bin/rsync -avz \
   --exclude='.env' \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
@@ -244,16 +244,16 @@ SSHPASS='<password>' sshpass -e /usr/bin/rsync -avz \
   --exclude='venv' \
   --exclude='template_data' \
   -e "ssh -o StrictHostKeyChecking=no" \
-  ./ root@162.120.19.127:/opt/buildcontrol/
+  ./ root@<YOUR_VPS_IP>:/opt/buildcontrol/
 
 # 2. Restart the service
-ssh root@162.120.19.127 "systemctl restart buildcontrol && systemctl status buildcontrol --no-pager"
+ssh root@<YOUR_VPS_IP> "systemctl restart buildcontrol && systemctl status buildcontrol --no-pager"
 ```
 
 ### Option B — manual on the server
 
 ```bash
-ssh root@162.120.19.127
+ssh root@<YOUR_VPS_IP>
 cd /opt/buildcontrol
 
 # Pull latest code (if you set up git on the server)
