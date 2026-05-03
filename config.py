@@ -49,13 +49,28 @@ class Settings:
         self.openrouter_model: str = os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
 
         # Comma-separated Telegram chat IDs authorised to use the director AI agent
-        _director_ids = os.getenv("TELEGRAM_DIRECTOR_CHAT_IDS", "753647644")
+        _director_ids = os.getenv("TELEGRAM_DIRECTOR_CHAT_IDS", "")
         self.telegram_director_chat_ids: set[int] = {
             int(x.strip()) for x in _director_ids.split(",") if x.strip().isdigit()
         }
 
         # SQLite database path
         self.db_path: str = os.getenv("DB_PATH", "/opt/buildcontrol/buildcontrol.db")
+
+        # Shared bearer token guarding /api/* and /upload. Single per-deployment
+        # secret — same trust boundary as .env. Required in prod.
+        self.api_token: str = os.getenv("BUILDCONTROL_API_TOKEN", "")
+
+    @property
+    def bitrix_iframe_origin(self) -> str:
+        """Origin (scheme + host) of the Bitrix24 portal that embeds the widget.
+
+        Derived from BITRIX24_DOMAIN. Used to scope CORS away from "*".
+        """
+        domain = (self.bitrix24_domain or "").strip()
+        if not domain:
+            return ""
+        return f"https://{domain}"
 
     def validate(self) -> None:
         """Validate that all required settings are configured."""
@@ -65,6 +80,12 @@ class Settings:
             )
         if not self.bitrix24_domain:
             raise ValueError("BITRIX24_DOMAIN not set in .env")
+        if not self.api_token:
+            raise ValueError(
+                "BUILDCONTROL_API_TOKEN not set in .env — required to "
+                "guard /api/* and /upload. Generate with `python -c "
+                "\"import secrets; print(secrets.token_urlsafe(48))\"`."
+            )
 
 
 # Global settings instance

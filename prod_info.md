@@ -50,10 +50,24 @@ VPS_URL=https://<cloudflare-tunnel-url>.trycloudflare.com
 DB_PATH=/opt/buildcontrol/buildcontrol.db
 LOG_LEVEL=INFO
 
+# Bearer token guarding /api/* and /upload (REQUIRED — app refuses to serve
+# protected routes without it). Generate once with:
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+BUILDCONTROL_API_TOKEN=<48+ char random string>
+
 # Telegram notifications (optional — app works without them)
 TELEGRAM_BOT_TOKEN=<token from @BotFather>
 TELEGRAM_CHAT_ID=<chat or group ID>
 NOTIFICATIONS_ENABLED=false
+```
+
+**Auth model:** every `/api/*` and `/upload` request requires `Authorization: Bearer $BUILDCONTROL_API_TOKEN`. The Bitrix iframe widget (`/bitrix/widget`) is rendered server-side with the token injected into a top-level `<script>` block; a `window.fetch` wrapper attaches the header to every outbound call. CORS is scoped to `https://$BITRIX24_DOMAIN`. Exempt paths: `/health`, `/bitrix/*`, `/approval/*` (HMAC-token gated), `/tg/webhook` (X-Telegram-Bot-Api-Secret-Token gated).
+
+**Smoke test after deploy:**
+```bash
+curl -X GET http://<VPS_IP>:8000/api/projects                                    # → 401
+curl -X GET http://<VPS_IP>:8000/api/projects -H "Authorization: Bearer $BUILDCONTROL_API_TOKEN"  # → 200
+curl http://<VPS_IP>:8000/health                                                 # → 200
 ```
 
 Template is in `.env.example` in the repo.
@@ -394,7 +408,7 @@ The director can send messages in Russian to the bot to query any project's stat
 ```
 OPENROUTER_API_KEY=sk-or-v1-...        # from openrouter.ai → Keys
 OPENROUTER_MODEL=openai/gpt-4.1-mini   # or any OpenRouter model supporting tool_use
-TELEGRAM_DIRECTOR_CHAT_IDS=753647644   # comma-separated, director's Telegram chat id(s)
+TELEGRAM_DIRECTOR_CHAT_IDS=<chat-id>   # comma-separated, director's Telegram chat id(s)
 ```
 
 After setting these, restart: `systemctl restart buildcontrol`.
