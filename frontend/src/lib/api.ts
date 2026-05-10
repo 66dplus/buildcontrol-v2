@@ -118,6 +118,38 @@ export interface DashboardSummary {
   kpi: DashboardKpi;
 }
 
+export interface Member {
+  id: number;
+  name: string;
+  last_name: string;
+}
+
+export interface AssignmentRow {
+  phase: string;
+  responsible_id: number | null;
+  responsible_name: string;
+}
+
+export interface AssignPreviewResult {
+  assignments: AssignmentRow[];
+}
+
+export interface ApplyAssignmentsResult {
+  updated: number;
+  errors: string[];
+}
+
+export interface ImportStatus {
+  status: "running" | "done" | "error";
+  filename: string;
+  result?: {
+    project_id: number;
+    project_name: string;
+    task_count: number;
+  };
+  error?: string;
+}
+
 export interface PurchaseRequest {
   id: string;
   project_id: number;
@@ -202,6 +234,28 @@ export const api = {
     jsonFetch<PurchaseRequest>(`/api/purchase-requests/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
+    }),
+  importStatus: (jobId: string) =>
+    jsonFetch<ImportStatus>(`/api/import-status/${jobId}`),
+  projectMembers: (projectId: number) =>
+    jsonFetch<Member[]>(`/api/projects/${projectId}/members`),
+  assignPreview: (
+    projectId: number,
+    text: string,
+    users: Member[],
+    phases: string[],
+  ) =>
+    jsonFetch<AssignPreviewResult>("/api/agent/assign-preview", {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, text, users, phases }),
+    }),
+  applyAssignments: (
+    projectId: number,
+    assignments: Array<{ phase: string; responsible_id: number }>,
+  ) =>
+    jsonFetch<ApplyAssignmentsResult>("/api/agent/apply-assignments", {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, assignments }),
     }),
 };
 

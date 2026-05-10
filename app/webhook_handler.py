@@ -289,6 +289,205 @@ async def import_status(job_id: str) -> JSONResponse:
     return JSONResponse(content=job)
 
 
+@app.get("/api/projects/{project_id}/members")
+async def api_project_members(project_id: int) -> JSONResponse:
+    """
+    Return Bitrix24 workgroup members for the given project.
+
+    project_id == Bitrix workgroup ID (projects.id is the workgroup ID).
+    Returns [{id, name, last_name}].
+    """
+    async with get_db() as conn:
+        async with conn.execute(
+            "SELECT id FROM projects WHERE id=?", (project_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    async with BitrixClient() as client:
+        resp = await client.call("sonet_group.user.get", {"ID": project_id})
+    users_raw = resp.get("result", []) if isinstance(resp.get("result"), list) else []
+
+    members = [
+        {
+            "id": int(u.get("USER_ID", 0)),
+            "name": u.get("USER_NAME", ""),
+            "last_name": u.get("USER_LAST_NAME", ""),
+        }
+        for u in users_raw
+        if u.get("USER_ID")
+    ]
+    return JSONResponse(content=members)
+
+
+@app.post("/api/agent/assign-preview")
+async def api_assign_preview(request: Request) -> JSONResponse:
+    """
+    Parse a natural-language assignment string into a structured table.
+
+    Body:
+      {
+        "project_id": 1,
+        "text": "Алексея на этапы 1–3, Андрея на Каркас",
+        "users": [{"id": 5, "name": "Алексей", "last_name": "Петров"}, ...],
+        "phases": ["Этап 1", "Этап 2", ...]
+      }
+
+    Returns:
+      {"assignments": [{"phase": "Этап 1", "responsible_id": 5, "responsible_name": "Алексей Петров"}, ...]}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    text = (body.get("text") or "").strip()
+    users = body.get("users") or []
+    phases = body.get("phases") or []
+
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if not settings.openrouter_api_key:
+        # Demo fallback — assign everyone to user 1
+        return JSONResponse(content={"assignments": [
+            {"phase": p, "responsible_id": 1, "responsible_name": "Демо-пользователь"}
+            for p in phases
+        ]})
+
+    from openai import AsyncOpenAI
+    import json as _json
+
+    client_llm = AsyncOpenAI(
+        api_key=settings.openrouter_api_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    users_str = "\n".join(
+        f"  ID {u['id']}: {u.get('name', '')} {u.get('last_name', '')}".strip()
+        for u in users
+    ) or "  (нет данных)"
+    phases_str = "\n".join(f"  - {p}" for p in phases) or "  (нет данных)"
+
+    prompt = f"""Ты помощник по распределению задач на строительном проекте.
+
+Список сотрудников (Bitrix24 user ID: имя):
+{users_str}
+
+Список этапов проекта:
+{phases_str}
+
+Текст распределения от директора:
+\"{text}\"
+
+Задача: сопоставь каждый этап с ответственным по тексту директора.
+Если для этапа ответственный явно не указан — оставь responsible_id = null.
+Ответь ТОЛЬКО валидным JSON без пояснений в таком формате:
+{{
+  "assignments": [
+    {{"phase": "Этап 1", "responsible_id": 5, "responsible_name": "Алексей Петров"}},
+    ...
+  ]
+}}"""
+
+    try:
+        resp = await client_llm.chat.completions.create(
+            model=settings.openrouter_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = _json.loads(raw)
+        return JSONResponse(content=parsed)
+    except Exception as exc:
+        logger.exception("assign-preview LLM call failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"LLM error: {exc}")
+
+
+@app.post("/api/agent/apply-assignments")
+async def api_apply_assignments(request: Request) -> JSONResponse:
+    """
+    Apply phase–responsible_id assignments to existing Bitrix24 tasks + SQLite.
+
+    Body:
+      {
+        "project_id": 1,
+        "assignments": [
+          {"phase": "Этап 1", "responsible_id": 5},
+          ...
+        ]
+      }
+
+    Updates tasks.task.update in Bitrix24 for each task in the phase,
+    and writes an audit log row per assignment.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    project_id = body.get("project_id")
+    assignments = body.get("assignments") or []
+
+    if not project_id or not assignments:
+        raise HTTPException(status_code=400, detail="project_id and assignments required")
+
+    # Build a {phase → responsible_id} map.
+    phase_map: dict[str, int] = {}
+    for a in assignments:
+        phase = (a.get("phase") or "").strip()
+        resp_id = a.get("responsible_id")
+        if phase and resp_id:
+            phase_map[phase] = int(resp_id)
+
+    if not phase_map:
+        return JSONResponse(content={"updated": 0})
+
+    # Load tasks from SQLite.
+    async with get_db() as conn:
+        async with conn.execute(
+            "SELECT id, bitrix_task_id, phase FROM tasks WHERE project_id=?",
+            (project_id,),
+        ) as cur:
+            task_rows = await cur.fetchall()
+
+    updated = 0
+    errors: list[str] = []
+
+    async with BitrixClient() as bx:
+        for row in task_rows:
+            phase = (row["phase"] or "").strip()
+            responsible_id = phase_map.get(phase)
+            if not responsible_id:
+                continue
+            bx_task_id = row["bitrix_task_id"]
+            if bx_task_id:
+                try:
+                    await bx.call("tasks.task.update", {
+                        "taskId": int(bx_task_id),
+                        "fields": {"RESPONSIBLE_ID": responsible_id},
+                    })
+                except Exception as exc:
+                    errors.append(f"task {bx_task_id}: {exc}")
+                    continue
+            updated += 1
+
+    # Audit log
+    from app.agent_tools import _write_audit_log
+    await _write_audit_log(
+        "apply_assignments",
+        {"project_id": project_id, "phase_map": phase_map},
+        {"updated": updated, "errors": errors},
+        "confirmed",
+    )
+
+    return JSONResponse(content={"updated": updated, "errors": errors})
+
+
 # ---------------------------------------------------------------------------
 # Report API endpoints
 # ---------------------------------------------------------------------------
