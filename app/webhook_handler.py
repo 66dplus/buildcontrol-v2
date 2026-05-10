@@ -18,12 +18,11 @@ Domain routes live in app/routes/:
   agent.py     — POST /api/agent/chat
 """
 
-import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Optional, Union
+from typing import AsyncGenerator, Union
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request
@@ -37,7 +36,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from bitrix.client import BitrixClient
 from config import settings
 from db.database import get_db
-from db import repo
 
 logging.basicConfig(
     level=logging.INFO,
