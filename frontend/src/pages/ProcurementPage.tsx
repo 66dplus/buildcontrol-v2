@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Project, type PurchaseRequest } from "../lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api, type MaterialRow, type Project, type PurchaseRequest } from "../lib/api";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -52,6 +52,22 @@ function SubmitTab({ projects }: { projects: Project[] }) {
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [catalog, setCatalog] = useState<MaterialRow[]>([]);
+
+  useEffect(() => {
+    if (!projectId) { setCatalog([]); return; }
+    api.materialsAll(projectId).then(setCatalog).catch(() => setCatalog([]));
+  }, [projectId]);
+
+  const catalogMaterials = useMemo(() => {
+    const seen = new Set<string>();
+    return catalog.filter((m) => {
+      if (seen.has(m.material_name)) return false;
+      seen.add(m.material_name);
+      return true;
+    });
+  }, [catalog]);
 
   const overPlanNames = lines
     .filter((l) => l.price_plan > 0 && l.price > l.price_plan)
@@ -144,13 +160,22 @@ function SubmitTab({ projects }: { projects: Project[] }) {
                 line.price_plan > 0 && line.price > line.price_plan ? "bg-warning/5 rounded" : ""
               }`}
             >
-              <input
-                type="text"
+              <select
                 value={line.material_name}
-                onChange={(e) => updateLine(line.id, { material_name: e.target.value })}
-                placeholder="Наименование"
-                className="border border-border rounded px-2 py-1 text-xs text-ink bg-bg focus:outline-none focus:border-accent"
-              />
+                onChange={(e) => {
+                  const mat = catalogMaterials.find((m) => m.material_name === e.target.value);
+                  updateLine(line.id, { material_name: e.target.value });
+                  if (mat?.price_plan) updateLine(line.id, { price_plan: mat.price_plan });
+                }}
+                className="w-full border border-border rounded-card px-2 py-1.5 text-sm bg-bg text-ink focus:outline-none focus:border-accent"
+              >
+                <option value="">— выбрать материал —</option>
+                {catalogMaterials.map((m) => (
+                  <option key={m.material_name} value={m.material_name}>
+                    {m.material_name} ({m.unit})
+                  </option>
+                ))}
+              </select>
               <input
                 type="number"
                 min={0}

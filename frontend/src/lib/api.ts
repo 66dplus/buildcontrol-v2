@@ -266,6 +266,8 @@ export const api = {
     jsonFetch<MaterialRow[]>(
       `/api/projects/${projectId}/materials-all${qs({ phase, task })}`,
     ),
+  materialsAll: (projectId: number) =>
+    jsonFetch<MaterialRow[]>(`/api/projects/${projectId}/materials-all`),
   labor: (projectId: number, phase?: string, task?: string) =>
     jsonFetch<LaborRow[]>(
       `/api/projects/${projectId}/labor-all${qs({ phase, task })}`,
