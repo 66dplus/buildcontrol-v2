@@ -45,7 +45,12 @@ async def _list_projects(**_: Any) -> Any:
 })
 async def _query_database(sql: str, **_: Any) -> Any:
     sql_clean = sql.strip().rstrip(";")
-    if not sql_clean.upper().lstrip().startswith("SELECT"):
+    # Strip leading SQL comment lines (-- ...) before the SELECT check so the
+    # LLM can annotate queries without hitting the "only SELECT" guard.
+    non_comment = "\n".join(
+        line for line in sql_clean.splitlines() if not line.strip().startswith("--")
+    ).strip()
+    if not non_comment.upper().startswith("SELECT"):
         return {"error": "Only SELECT queries are allowed"}
     if "LIMIT" not in sql_clean.upper():
         sql_clean += " LIMIT 200"

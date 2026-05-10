@@ -62,6 +62,26 @@ async def test_query_database_blocks_non_select(db_path):
 
 
 @pytest.mark.asyncio
+async def test_query_database_allows_commented_select(db_path):
+    """SQL starting with -- comment lines must still work (LLM annotates its queries)."""
+    import app.agent.tools.read
+    from app.agent.tools import dispatch
+    sql = '{"sql": "-- check active projects\\nSELECT id FROM projects WHERE is_archived=0"}'
+    result = await dispatch("query_database", sql)
+    assert isinstance(result, list)
+
+
+@pytest.mark.asyncio
+async def test_query_database_blocks_non_select_after_comment(db_path):
+    """A non-SELECT disguised with a leading comment must still be blocked."""
+    import app.agent.tools.read
+    from app.agent.tools import dispatch
+    sql = '{"sql": "-- looks safe\\nDELETE FROM projects"}'
+    result = await dispatch("query_database", sql)
+    assert "error" in result
+
+
+@pytest.mark.asyncio
 async def test_query_database_appends_limit(db_path):
     import app.agent.tools.read
     from app.agent.tools import dispatch
