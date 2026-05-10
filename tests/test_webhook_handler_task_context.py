@@ -6,7 +6,8 @@ from typing import Any, Optional
 import pytest
 from starlette.requests import Request
 
-from app import webhook_handler
+from app.routes import projects as projects_module
+from app.routes import reports as reports_module
 
 
 def _make_element(element_id: int, name: str, props: dict[int, Any]) -> dict[str, Any]:
@@ -40,10 +41,10 @@ def test_stage_resolution_fallback_with_null_system_type() -> None:
         {"ID": "103", "SORT": "300", "SYSTEM_TYPE": None, "TITLE": "Завершена"},
     ]
 
-    assert webhook_handler._resolve_stage_system_type(stages, 101) == "NEW"
-    assert webhook_handler._resolve_stage_system_type(stages, 102) == "PROGRESS"
-    assert webhook_handler._resolve_stage_system_type(stages, 103) == "FINISH"
-    assert webhook_handler._resolve_parent_stage_targets(stages) == (102, 103)
+    assert reports_module._resolve_stage_system_type(stages, 101) == "NEW"
+    assert reports_module._resolve_stage_system_type(stages, 102) == "PROGRESS"
+    assert reports_module._resolve_stage_system_type(stages, 103) == "FINISH"
+    assert reports_module._resolve_parent_stage_targets(stages) == (102, 103)
 
 
 @pytest.mark.asyncio
@@ -56,7 +57,7 @@ async def test_api_task_context_returns_filtered_payload(monkeypatch: pytest.Mon
     async def fake_get_db():
         yield object()
 
-    monkeypatch.setattr(webhook_handler, "get_db", fake_get_db)
+    monkeypatch.setattr(projects_module, "get_db", fake_get_db)
 
     async def fake_get_materials(conn: object, project_id: int, phase: Any = None, task_name: Any = None) -> list:
         all_rows = [
@@ -85,9 +86,9 @@ async def test_api_task_context_returns_filtered_payload(monkeypatch: pytest.Mon
             return [all_rows[0]]
         return all_rows
 
-    monkeypatch.setattr(webhook_handler.repo, "get_materials", fake_get_materials)
-    monkeypatch.setattr(webhook_handler.repo, "get_labor", fake_get_labor)
-    monkeypatch.setattr(webhook_handler.repo, "get_equipment", fake_get_equipment)
+    monkeypatch.setattr(projects_module.repo, "get_materials", fake_get_materials)
+    monkeypatch.setattr(projects_module.repo, "get_labor", fake_get_labor)
+    monkeypatch.setattr(projects_module.repo, "get_equipment", fake_get_equipment)
 
     # Subtasks still come from Bitrix — mock _get_list_context for that only
     sub_field_map = {
@@ -110,17 +111,17 @@ async def test_api_task_context_returns_filtered_payload(monkeypatch: pytest.Mon
         async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
             return None
 
-    monkeypatch.setattr(webhook_handler, "BitrixClient", lambda: DummyClientCtx())
+    monkeypatch.setattr(projects_module, "BitrixClient", lambda: DummyClientCtx())
 
     async def fake_get_list_context(client: object, project_id: int, keyword: str) -> Any:
         if keyword == "подзадач":
             return 6, "subtasks", sub_field_map, subtasks
         return None
 
-    monkeypatch.setattr(webhook_handler, "_get_list_context", fake_get_list_context)
+    monkeypatch.setattr(projects_module, "_get_list_context", fake_get_list_context)
 
     request = _make_request("etap=%D0%AD%D1%82%D0%B0%D0%BF%201&zadacha=%D0%97%D0%B0%D0%B4%D0%B0%D1%87%D0%B0%201")
-    response = await webhook_handler.api_task_context(42, request)
+    response = await projects_module.api_task_context(42, request)
     payload = json.loads(response.body)
 
     assert set(payload.keys()) == {"materials", "labor", "equipment", "subtasks"}
@@ -217,17 +218,17 @@ async def _run_parent_kanban_progress_case(
     async def fake_add_task_comment(client: object, task_id: int, message: str) -> int:
         return 1
 
-    monkeypatch.setattr(webhook_handler, "_get_list_context", fake_get_list_context)
-    monkeypatch.setattr(webhook_handler.lists, "get_elements", fake_get_elements)
-    monkeypatch.setattr(webhook_handler.lists, "update_element", fake_update_element)
-    monkeypatch.setattr(webhook_handler.tasks_methods, "get_task_stages", fake_get_task_stages)
-    monkeypatch.setattr(webhook_handler.tasks_methods, "move_task_to_stage", fake_move_task_to_stage)
-    monkeypatch.setattr(webhook_handler.tasks_methods, "start_task", fake_start_task)
-    monkeypatch.setattr(webhook_handler.tasks_methods, "complete_task", fake_complete_task)
-    monkeypatch.setattr(webhook_handler.tasks_methods, "find_task_by_title", fake_find_task_by_title)
-    monkeypatch.setattr(webhook_handler.tasks_methods, "add_task_comment", fake_add_task_comment)
+    monkeypatch.setattr(reports_module, "_get_list_context", fake_get_list_context)
+    monkeypatch.setattr(reports_module.lists, "get_elements", fake_get_elements)
+    monkeypatch.setattr(reports_module.lists, "update_element", fake_update_element)
+    monkeypatch.setattr(reports_module.tasks_methods, "get_task_stages", fake_get_task_stages)
+    monkeypatch.setattr(reports_module.tasks_methods, "move_task_to_stage", fake_move_task_to_stage)
+    monkeypatch.setattr(reports_module.tasks_methods, "start_task", fake_start_task)
+    monkeypatch.setattr(reports_module.tasks_methods, "complete_task", fake_complete_task)
+    monkeypatch.setattr(reports_module.tasks_methods, "find_task_by_title", fake_find_task_by_title)
+    monkeypatch.setattr(reports_module.tasks_methods, "add_task_comment", fake_add_task_comment)
 
-    await webhook_handler._update_subtask_progress(
+    await reports_module._update_subtask_progress(
         client=object(),
         project_id=42,
         task_etap="Этап 1",
