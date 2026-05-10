@@ -65,7 +65,8 @@ export function StagesTab({ tasks }: StagesTabProps) {
             <th className="px-4 py-3 text-left font-medium">Этап</th>
             <th className="px-4 py-3 text-right font-medium">Задач</th>
             <th className="px-4 py-3 text-right font-medium">Готовность</th>
-            <th className="px-4 py-3 text-right font-medium">Бюджет план/факт</th>
+            <th className="px-4 py-3 text-right font-medium">Бюджет план</th>
+            <th className="px-4 py-3 text-right font-medium">Бюджет факт</th>
             <th className="px-4 py-3 text-right font-medium">Откл.</th>
           </tr>
         </thead>
@@ -91,11 +92,11 @@ export function StagesTab({ tasks }: StagesTabProps) {
                 <td className="px-4 py-3 text-right tabular text-ink">
                   {formatPercent(p.avgCompletion)}
                 </td>
-                <td className="px-4 py-3 text-right tabular">
-                  <div className="text-muted">{formatMoney(p.totalPlan, { compact: true })}</div>
-                  <div className="text-ink font-medium">
-                    {formatMoney(p.totalActual, { compact: true })}
-                  </div>
+                <td className="px-4 py-3 text-right tabular text-muted">
+                  {formatMoney(p.totalPlan, { compact: true })}
+                </td>
+                <td className="px-4 py-3 text-right tabular text-ink font-medium">
+                  {formatMoney(p.totalActual, { compact: true })}
                 </td>
                 <td
                   className={`px-4 py-3 text-right tabular font-medium ${
