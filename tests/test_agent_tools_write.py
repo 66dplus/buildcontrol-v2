@@ -108,3 +108,23 @@ async def test_add_comment_is_write_tool():
     from app.agent.tools import TOOL_REGISTRY
     _, _, is_write = TOOL_REGISTRY["add_comment"]
     assert is_write
+
+
+@pytest.mark.asyncio
+async def test_assign_user_calls_tasks_update(db_with_project):
+    import app.agent.tools.assign_user
+    from app.agent.tools.assign_user import _assign_user_tool
+    dummy = DummyClient()
+    result = await _assign_user_tool(client=dummy, task_id=42, user_id=7, session_id="s1")
+    assert result["success"] is True
+    params_list = [p for m, p in dummy.calls if m == "tasks.task.update"]
+    assert params_list
+    assert params_list[0]["fields"]["RESPONSIBLE_ID"] == 7
+
+
+@pytest.mark.asyncio
+async def test_assign_user_is_write_tool():
+    import app.agent.tools.assign_user
+    from app.agent.tools import TOOL_REGISTRY
+    _, _, is_write = TOOL_REGISTRY["assign_user"]
+    assert is_write
