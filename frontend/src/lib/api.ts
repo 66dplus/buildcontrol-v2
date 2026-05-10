@@ -118,6 +118,39 @@ export interface DashboardSummary {
   kpi: DashboardKpi;
 }
 
+export interface ForemanTask {
+  etap: string;
+  zadacha: string;
+  budget_plan: number;
+  element_id: number;
+  bitrix_task_id: string | null;
+}
+
+export interface ForemanMaterial {
+  name: string;
+  unit: string;
+  stock: number;
+  qty_plan: number;
+  qty_bought: number;
+  price_plan: number;
+}
+
+export interface ForemanLabor {
+  name: string;
+  role: string;
+}
+
+export interface ForemanEquipment {
+  name: string;
+}
+
+export interface Stage {
+  id: number;
+  title: string;
+  sort: number;
+  system_type: string | null;
+}
+
 export interface Member {
   id: number;
   name: string;
@@ -233,6 +266,39 @@ export const api = {
   ) =>
     jsonFetch<PurchaseRequest>(`/api/purchase-requests/${id}`, {
       method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  foremanTasks: (projectId: number) =>
+    jsonFetch<ForemanTask[]>(`/api/projects/${projectId}/tasks`),
+  foremanMaterials: (projectId: number, etap: string, zadacha: string) =>
+    jsonFetch<ForemanMaterial[]>(
+      `/api/projects/${projectId}/materials${qs({ etap, zadacha })}`,
+    ),
+  foremanLabor: (projectId: number, etap: string, zadacha: string) =>
+    jsonFetch<ForemanLabor[]>(
+      `/api/projects/${projectId}/labor${qs({ etap, zadacha })}`,
+    ),
+  foremanEquipment: (projectId: number, etap: string, zadacha: string) =>
+    jsonFetch<ForemanEquipment[]>(
+      `/api/projects/${projectId}/equipment${qs({ etap, zadacha })}`,
+    ),
+  stages: (projectId: number) =>
+    jsonFetch<Stage[]>(`/api/projects/${projectId}/stages`),
+  submitReport: (body: {
+    project_id: number;
+    date: string;
+    comments: string;
+    tasks: Array<{
+      task_etap: string;
+      task_zadacha: string;
+      stage_id?: number;
+      materials: Array<{ name: string; quantity: number }>;
+      labor: Array<{ name: string; hours: number }>;
+      equipment: Array<{ name: string; hours: number }>;
+    }>;
+  }) =>
+    jsonFetch<{ success: boolean; link: string }>("/api/report", {
+      method: "POST",
       body: JSON.stringify(body),
     }),
   importStatus: (jobId: string) =>
