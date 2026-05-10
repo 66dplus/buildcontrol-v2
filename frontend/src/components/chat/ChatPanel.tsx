@@ -3,6 +3,17 @@ import { streamChat, type PendingAction } from "../../lib/sse";
 import { MessageBubble, type MessageRole } from "./MessageBubble";
 import { ConfirmActionCard } from "./ConfirmActionCard";
 
+const DOT_FRAMES = [".", "..", "..."];
+
+function ThinkingIndicator() {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setFrame((f) => (f + 1) % DOT_FRAMES.length), 600);
+    return () => clearInterval(id);
+  }, []);
+  return <span>AI-Ассистент думает {DOT_FRAMES[frame]}</span>;
+}
+
 interface ChatMessage {
   id: number;
   role: MessageRole;
@@ -149,8 +160,10 @@ export function ChatPanel({
           )
         )}
         {streaming && messages[messages.length - 1]?.text === "" && !messages[messages.length - 1]?.action ? (
-          <div className="text-muted text-xs" data-testid="chat-thinking">
-            …думаю
+          <div className="flex justify-start" data-testid="chat-thinking">
+            <div className="bg-surface border border-border text-muted rounded-card px-4 py-2 text-sm">
+              <ThinkingIndicator />
+            </div>
           </div>
         ) : null}
       </div>
