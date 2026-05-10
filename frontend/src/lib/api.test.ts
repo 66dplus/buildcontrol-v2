@@ -65,15 +65,13 @@ describe("api.materials", () => {
   });
 });
 
-describe("api.patchPurchaseRequest", () => {
-  it("sends PATCH with JSON body", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ id: "abc", status: "approved" }));
-    await api.patchPurchaseRequest("abc", { decision: "approve", comment: "ok" });
-    const init = fetchMock.mock.calls[0][1] as RequestInit;
-    expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body as string)).toEqual({
-      decision: "approve",
-      comment: "ok",
-    });
+describe("api.decideRequest", () => {
+  it("sends POST with FormData to the decide endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    await api.decideRequest(123, "approve", "ok");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/purchase-requests/123/decide");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeInstanceOf(FormData);
   });
 });

@@ -259,15 +259,46 @@ export const api = {
       `/api/projects/${projectId}/equipment-all${qs({ phase, task })}`,
     ),
   purchaseRequestsPending: () =>
-    jsonFetch<PurchaseRequest[]>("/api/purchase-requests?status=pending"),
-  patchPurchaseRequest: (
-    id: string,
-    body: { decision: "approve" | "reject"; comment?: string },
-  ) =>
-    jsonFetch<PurchaseRequest>(`/api/purchase-requests/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(body),
-    }),
+    jsonFetch<PurchaseRequest[]>("/api/purchase-requests/pending"),
+  decideRequest: (id: number, decision: "approve" | "reject", comment: string) => {
+    const token = readBearerToken();
+    const headers: Record<string, string> = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const body = new FormData();
+    body.append("decision", decision);
+    body.append("comment", comment);
+    return fetch(`/api/purchase-requests/${id}/decide`, {
+      method: "POST",
+      headers,
+      body,
+    }).then(async (res) => {
+      if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => ""));
+      return res.json();
+    });
+  },
+  submitPurchaseRequest: (
+    projectId: number,
+    items: Array<{ material_name: string; qty: number; unit: string; price: number; price_plan?: number }>,
+    proposalFile: File,
+    buyerComment: string,
+  ) => {
+    const token = readBearerToken();
+    const headers: Record<string, string> = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const body = new FormData();
+    body.append("project_id", String(projectId));
+    body.append("items_json", JSON.stringify(items));
+    body.append("proposal", proposalFile);
+    body.append("buyer_comment", buyerComment);
+    return fetch("/api/purchase-request", {
+      method: "POST",
+      headers,
+      body,
+    }).then(async (res) => {
+      if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => ""));
+      return res.json() as Promise<{ request_id: string; request_no: string }>;
+    });
+  },
   foremanTasks: (projectId: number) =>
     jsonFetch<ForemanTask[]>(`/api/projects/${projectId}/tasks`),
   foremanMaterials: (projectId: number, etap: string, zadacha: string) =>
