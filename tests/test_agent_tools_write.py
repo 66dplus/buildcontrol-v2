@@ -88,3 +88,23 @@ async def test_create_task_writes_audit_log(db_with_project):
             rows = await cur.fetchall()
     assert len(rows) == 1
     assert rows[0]["session_id"] == "audit-sess"
+
+
+@pytest.mark.asyncio
+async def test_add_comment_calls_bitrix(db_with_project):
+    import app.agent.tools.add_comment
+    from app.agent.tools.add_comment import _add_comment_tool
+    dummy = DummyClient()
+    result = await _add_comment_tool(
+        client=dummy, task_id=42, message="Test comment", session_id="s1"
+    )
+    assert result["comment_id"] == 55
+    assert any(m == "task.commentitem.add" for m, _ in dummy.calls)
+
+
+@pytest.mark.asyncio
+async def test_add_comment_is_write_tool():
+    import app.agent.tools.add_comment
+    from app.agent.tools import TOOL_REGISTRY
+    _, _, is_write = TOOL_REGISTRY["add_comment"]
+    assert is_write
