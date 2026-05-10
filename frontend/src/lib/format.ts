@@ -39,3 +39,16 @@ export function formatDate(iso: string | null): string {
     return iso;
   }
 }
+
+export function formatQty(value: number, unit?: string): string {
+  const n = Number.isFinite(value) ? value : 0;
+  const rounded = parseFloat(n.toFixed(2));
+  const str = rounded % 1 === 0 ? rounded.toFixed(0) : rounded.toString();
+  return unit ? `${str} ${unit}` : str;
+}
+
+export function formatHours(value: number): string {
+  const n = Number.isFinite(value) ? value : 0;
+  const rounded = parseFloat(n.toFixed(1));
+  return rounded % 1 === 0 ? `${rounded.toFixed(0)} ч` : `${rounded} ч`;
+}
