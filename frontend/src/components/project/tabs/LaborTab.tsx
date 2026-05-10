@@ -1,11 +1,54 @@
+import { useState } from "react";
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip,
+  ResponsiveContainer, Legend, CartesianGrid,
+} from "recharts";
 import type { LaborRow } from "../../../lib/api";
-import { formatMoney, formatPercent, variancePct } from "../../../lib/format";
+import { formatMoney, formatPercent, formatHours, variancePct } from "../../../lib/format";
 
 interface LaborTabProps {
   rows: LaborRow[];
 }
 
+function LaborChart({ rows }: { rows: LaborRow[] }) {
+  const data = rows.map((r) => ({
+    name: r.specialty.length > 20 ? r.specialty.slice(0, 18) + "…" : r.specialty,
+    plan: parseFloat(r.hours_plan.toFixed(1)),
+    fact: parseFloat(r.hours_actual.toFixed(1)),
+  }));
+
+  return (
+    <div className="bg-surface border border-border rounded-card p-4 shadow-card">
+      <ResponsiveContainer width="100%" height={Math.max(220, data.length * 36)}>
+        <BarChart data={data} layout="vertical" margin={{ left: 16, right: 24, top: 4, bottom: 4 }}>
+          <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e5e7eb" />
+          <XAxis
+            type="number"
+            tick={{ fontSize: 11, fill: "#78716c" }}
+            tickLine={false}
+            axisLine={false}
+          />
+          <YAxis
+            type="category"
+            dataKey="name"
+            tick={{ fontSize: 11, fill: "#44403c" }}
+            tickLine={false}
+            axisLine={false}
+            width={130}
+          />
+          <Tooltip />
+          <Legend />
+          <Bar dataKey="plan" name="План, ч" fill="#94a3b8" radius={[0, 3, 3, 0]} />
+          <Bar dataKey="fact" name="Факт, ч" fill="#3ba6f1" radius={[0, 3, 3, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 export function LaborTab({ rows }: LaborTabProps) {
+  const [view, setView] = useState<"table" | "chart">("table");
+
   if (rows.length === 0) {
     return (
       <div
@@ -18,64 +61,91 @@ export function LaborTab({ rows }: LaborTabProps) {
   }
 
   return (
-    <div
-      className="bg-surface border border-border rounded-card overflow-hidden shadow-card"
-      data-testid="labor-tab"
-    >
-      <table className="w-full text-sm">
-        <thead className="bg-bg border-b border-border text-muted text-xs uppercase tracking-wide">
-          <tr>
-            <th className="px-4 py-3 text-left font-medium">Специальность</th>
-            <th className="px-4 py-3 text-left font-medium">Этап / Задача</th>
-            <th className="px-4 py-3 text-right font-medium">Ставка</th>
-            <th className="px-4 py-3 text-right font-medium">Часов план/факт</th>
-            <th className="px-4 py-3 text-right font-medium">ФОТ план/факт</th>
-            <th className="px-4 py-3 text-right font-medium">Откл.</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => {
-            const v = variancePct(r.payroll_plan, r.payroll_actual);
-            const overrun = v > 15;
-            return (
-              <tr
-                key={r.id}
-                data-testid={`labor-row-${r.id}`}
-                className={`border-b border-border last:border-0 ${
-                  overrun ? "bg-warning/5" : ""
-                }`}
-              >
-                <td className="px-4 py-3 text-ink font-medium">{r.specialty}</td>
-                <td className="px-4 py-3 text-muted">
-                  <div>{r.phase}</div>
-                  <div className="text-xs">{r.task_name}</div>
-                </td>
-                <td className="px-4 py-3 text-right tabular text-ink">
-                  {formatMoney(r.rate)}/ч
-                </td>
-                <td className="px-4 py-3 text-right tabular">
-                  <div className="text-muted">{r.hours_plan}</div>
-                  <div className="text-ink">{r.hours_actual}</div>
-                </td>
-                <td className="px-4 py-3 text-right tabular">
-                  <div className="text-muted">{formatMoney(r.payroll_plan, { compact: true })}</div>
-                  <div className="text-ink font-medium">
-                    {formatMoney(r.payroll_actual, { compact: true })}
-                  </div>
-                </td>
-                <td
-                  className={`px-4 py-3 text-right tabular font-medium ${
-                    overrun ? "text-warning" : "text-ink"
-                  }`}
-                >
-                  {v > 0 ? "+" : ""}
-                  {formatPercent(v, 1)}
-                </td>
+    <div className="flex flex-col gap-3" data-testid="labor-tab">
+      <div className="flex justify-end">
+        <div className="flex gap-1 p-0.5 bg-bg border border-border rounded-pill text-xs">
+          {(["table", "chart"] as const).map((v) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => setView(v)}
+              className={`px-3 py-1 rounded-pill transition-colors ${
+                view === v
+                  ? "bg-surface text-ink font-medium shadow-card"
+                  : "text-muted hover:text-ink"
+              }`}
+            >
+              {v === "table" ? "Таблица" : "График"}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {view === "chart" ? (
+        <LaborChart rows={rows} />
+      ) : (
+        <div className="bg-surface border border-border rounded-card overflow-hidden shadow-card">
+          <table className="w-full text-sm">
+            <thead className="bg-bg border-b border-border text-muted text-xs uppercase tracking-wide">
+              <tr>
+                <th className="px-4 py-3 text-left font-medium">Специальность</th>
+                <th className="px-4 py-3 text-left font-medium">Этап / Задача</th>
+                <th className="px-4 py-3 text-right font-medium">Ставка</th>
+                <th className="px-4 py-3 text-right font-medium">Часов план</th>
+                <th className="px-4 py-3 text-right font-medium">Часов факт</th>
+                <th className="px-4 py-3 text-right font-medium">ФОТ план/факт</th>
+                <th className="px-4 py-3 text-right font-medium">Откл.</th>
               </tr>
-            );
-          })}
-        </tbody>
-      </table>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const v = variancePct(r.payroll_plan, r.payroll_actual);
+                const overrun = v > 15;
+                return (
+                  <tr
+                    key={r.id}
+                    data-testid={`labor-row-${r.id}`}
+                    className={`border-b border-border last:border-0 ${
+                      overrun ? "bg-warning/5" : ""
+                    }`}
+                  >
+                    <td className="px-4 py-3 text-ink font-medium">{r.specialty}</td>
+                    <td className="px-4 py-3 text-muted">
+                      <div>{r.phase}</div>
+                      <div className="text-xs">{r.task_name}</div>
+                    </td>
+                    <td className="px-4 py-3 text-right tabular text-ink">
+                      {formatMoney(r.rate)}/ч
+                    </td>
+                    <td className="px-4 py-3 text-right tabular text-muted">
+                      {formatHours(r.hours_plan)}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular text-ink">
+                      {formatHours(r.hours_actual)}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular">
+                      <div className="text-muted">
+                        {formatMoney(r.payroll_plan, { compact: true })}
+                      </div>
+                      <div className="text-ink font-medium">
+                        {formatMoney(r.payroll_actual, { compact: true })}
+                      </div>
+                    </td>
+                    <td
+                      className={`px-4 py-3 text-right tabular font-medium ${
+                        overrun ? "text-warning" : "text-ink"
+                      }`}
+                    >
+                      {v > 0 ? "+" : ""}
+                      {formatPercent(v, 1)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
