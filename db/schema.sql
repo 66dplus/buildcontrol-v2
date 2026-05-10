@@ -110,6 +110,13 @@ CREATE TABLE IF NOT EXISTS purchase_requests (
     file_url TEXT DEFAULT ''   -- Bitrix disk download URL (added via migration)
 );
 
+CREATE TABLE IF NOT EXISTS idempotency_cache (
+    key TEXT PRIMARY KEY,
+    status_code INTEGER NOT NULL DEFAULT 200,
+    body_json TEXT NOT NULL,
+    stored_at INTEGER NOT NULL
+);
+
 -- Indexes for the most common query patterns
 CREATE INDEX IF NOT EXISTS idx_materials_project_phase_task
     ON materials(project_id, phase, task_name);

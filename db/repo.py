@@ -793,3 +793,51 @@ async def get_all_purchase_requests(
             d["items"] = []
         result.append(d)
     return result
+
+
+_IDEMPOTENCY_TTL = 24 * 3600
+
+
+async def get_idempotent_response(
+    conn: aiosqlite.Connection,
+    key: str,
+    now_ts: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if not key:
+        return None
+    if now_ts is None:
+        import time
+        now_ts = int(time.time())
+    async with conn.execute(
+        "SELECT status_code, body_json, stored_at FROM idempotency_cache WHERE key=?",
+        (key,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    if now_ts - row["stored_at"] > _IDEMPOTENCY_TTL:
+        await conn.execute("DELETE FROM idempotency_cache WHERE key=?", (key,))
+        await conn.commit()
+        return None
+    return {"status_code": row["status_code"], "body": json.loads(row["body_json"])}
+
+
+async def store_idempotent_response(
+    conn: aiosqlite.Connection,
+    key: str,
+    body: Any,
+    status_code: int = 200,
+    now_ts: Optional[int] = None,
+) -> None:
+    if not key:
+        return
+    if now_ts is None:
+        import time
+        now_ts = int(time.time())
+    body_json = json.dumps(body, ensure_ascii=False, default=str)
+    await conn.execute(
+        """INSERT OR IGNORE INTO idempotency_cache (key, status_code, body_json, stored_at)
+           VALUES (?, ?, ?, ?)""",
+        (key, status_code, body_json, now_ts),
+    )
+    await conn.commit()
