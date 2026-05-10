@@ -1810,6 +1810,55 @@ async def api_report(request: Request, background: BackgroundTasks) -> JSONRespo
 # catch-all does not shadow them.
 # ---------------------------------------------------------------------------
 
+@app.get("/api/projects/{project_id}/tasks-full")
+async def api_tasks_full(project_id: int) -> JSONResponse:
+    """
+    Full task rows from SQLite for the SPA Project Detail (Stages tab).
+
+    Differs from /api/projects/{id}/tasks (foreman dropdown) by returning
+    every column — dates, completion, stage, budget plan/actual.
+    """
+    async with get_db() as conn:
+        rows = await repo.get_tasks(conn, project_id)
+    return JSONResponse(content=rows)
+
+
+@app.get("/api/projects/{project_id}/materials-all")
+async def api_materials_all(
+    project_id: int,
+    phase: Optional[str] = None,
+    task: Optional[str] = None,
+) -> JSONResponse:
+    """All materials for a project, optionally filtered by ?phase=&task=."""
+    async with get_db() as conn:
+        rows = await repo.get_materials(conn, project_id, phase=phase, task_name=task)
+    return JSONResponse(content=rows)
+
+
+@app.get("/api/projects/{project_id}/labor-all")
+async def api_labor_all(
+    project_id: int,
+    phase: Optional[str] = None,
+    task: Optional[str] = None,
+) -> JSONResponse:
+    """All labor rows for a project, optionally filtered by ?phase=&task=."""
+    async with get_db() as conn:
+        rows = await repo.get_labor(conn, project_id, phase=phase, task_name=task)
+    return JSONResponse(content=rows)
+
+
+@app.get("/api/projects/{project_id}/equipment-all")
+async def api_equipment_all(
+    project_id: int,
+    phase: Optional[str] = None,
+    task: Optional[str] = None,
+) -> JSONResponse:
+    """All equipment rows for a project, optionally filtered by ?phase=&task=."""
+    async with get_db() as conn:
+        rows = await repo.get_equipment(conn, project_id, phase=phase, task_name=task)
+    return JSONResponse(content=rows)
+
+
 @app.get("/api/projects/{project_id}/phases")
 async def api_phases(project_id: int) -> JSONResponse:
     """
