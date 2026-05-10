@@ -128,3 +128,21 @@ async def test_assign_user_is_write_tool():
     from app.agent.tools import TOOL_REGISTRY
     _, _, is_write = TOOL_REGISTRY["assign_user"]
     assert is_write
+
+
+@pytest.mark.asyncio
+async def test_move_task_stage_calls_movetask(db_with_project):
+    import app.agent.tools.move_task_stage
+    from app.agent.tools.move_task_stage import _move_task_stage_tool
+    dummy = DummyClient()
+    result = await _move_task_stage_tool(client=dummy, task_id=42, stage_id=99, session_id="s1")
+    assert result["success"] is True
+    assert any(m == "task.stages.movetask" for m, _ in dummy.calls)
+
+
+@pytest.mark.asyncio
+async def test_move_task_stage_is_write_tool():
+    import app.agent.tools.move_task_stage
+    from app.agent.tools import TOOL_REGISTRY
+    _, _, is_write = TOOL_REGISTRY["move_task_stage"]
+    assert is_write
