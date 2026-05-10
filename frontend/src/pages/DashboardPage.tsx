@@ -1,14 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, type DashboardSummary, type BudgetTimeline } from "../lib/api";
+import { api, type DashboardSummary, type DashboardProject } from "../lib/api";
 import { formatMoney } from "../lib/format";
 import { KpiTile } from "../components/dashboard/KpiTile";
 import { ProjectTable } from "../components/dashboard/ProjectTable";
-import { BudgetTimelineChart } from "../components/BudgetTimelineChart";
 
 type LoadState =
   | { kind: "loading" }
-  | { kind: "ready"; summary: DashboardSummary; timeline: BudgetTimeline }
+  | { kind: "ready"; summary: DashboardSummary }
   | { kind: "error"; message: string };
 
 function pluralProjects(n: number): string {
@@ -17,15 +16,58 @@ function pluralProjects(n: number): string {
   return "проектов";
 }
 
+function BudgetBar({ label, plan, actual }: { label: string; plan: number; actual: number }) {
+  const pct = plan > 0 ? Math.min((actual / plan) * 100, 150) : 0;
+  const overrun = actual > plan;
+  return (
+    <div className="mb-4">
+      <div className="flex justify-between text-sm mb-1.5">
+        <span className="text-ink font-medium">{label}</span>
+        <span className={overrun ? "text-warning font-medium" : "text-muted"}>
+          {formatMoney(actual, { compact: true })} / {formatMoney(plan, { compact: true })}
+          {overrun ? " ⚠" : ""}
+        </span>
+      </div>
+      <div className="h-3 bg-bg rounded-full overflow-hidden border border-border">
+        <div
+          className={`h-full rounded-full ${overrun ? "bg-warning" : "bg-accent"}`}
+          style={{ width: `${Math.min(pct, 100)}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function BudgetComparisonPanel({ projects }: { projects: DashboardProject[] }) {
+  const totalPlan   = projects.reduce((s, p) => s + p.total_plan, 0);
+  const totalActual = projects.reduce((s, p) => s + p.total_actual, 0);
+  const matPlan     = projects.reduce((s, p) => s + p.materials_plan, 0);
+  const matActual   = projects.reduce((s, p) => s + p.materials_actual, 0);
+  const labPlan     = projects.reduce((s, p) => s + p.labor_plan, 0);
+  const labActual   = projects.reduce((s, p) => s + p.labor_actual, 0);
+  const eqPlan      = projects.reduce((s, p) => s + p.equipment_plan, 0);
+  const eqActual    = projects.reduce((s, p) => s + p.equipment_actual, 0);
+
+  return (
+    <div className="bg-surface border border-border rounded-card p-5 shadow-card">
+      <BudgetBar label="Итого" plan={totalPlan} actual={totalActual} />
+      <div className="border-t border-border my-3" />
+      <BudgetBar label="Материалы" plan={matPlan} actual={matActual} />
+      <BudgetBar label="Труд" plan={labPlan} actual={labActual} />
+      <BudgetBar label="Техника" plan={eqPlan} actual={eqActual} />
+    </div>
+  );
+}
+
 export function DashboardPage() {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
 
   useEffect(() => {
     let cancelled = false;
     setState({ kind: "loading" });
-    Promise.all([api.dashboardSummary(), api.dashboardBudgetTimeline()])
-      .then(([summary, timeline]) => {
-        if (!cancelled) setState({ kind: "ready", summary, timeline });
+    api.dashboardSummary()
+      .then((summary) => {
+        if (!cancelled) setState({ kind: "ready", summary });
       })
       .catch((err: Error) => {
         if (!cancelled) setState({ kind: "error", message: err.message });
@@ -45,7 +87,6 @@ export function DashboardPage() {
   }
 
   const { kpi, projects } = state.summary;
-  const { timeline } = state;
   const variancePct = kpi.total_plan
     ? ((kpi.total_actual - kpi.total_plan) / kpi.total_plan) * 100
     : 0;
@@ -59,7 +100,7 @@ export function DashboardPage() {
         </p>
       </div>
 
-      {/* Budget section: KPI tiles + timeline chart */}
+      {/* Budget section: KPI tiles + comparison bars */}
       <section>
         <h2 className="font-heading text-lg text-ink mb-4">Бюджет: план vs факт</h2>
 
@@ -83,23 +124,7 @@ export function DashboardPage() {
           />
         </div>
 
-        <div className="bg-surface border border-border rounded-card p-4 shadow-card">
-          <div className="flex items-center gap-4 text-xs text-muted mb-3">
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block w-6 h-0.5 bg-muted/50" style={{ borderTop: "2px dashed #94a3b8" }} />
-              План
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block w-6 h-0.5 bg-accent" style={{ borderTop: "2px solid #3ba6f1" }} />
-              Факт
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block w-2.5 h-2.5 rounded-full bg-warning" />
-              Перерасход &gt;10%
-            </span>
-          </div>
-          <BudgetTimelineChart timeline={timeline} height={260} />
-        </div>
+        <BudgetComparisonPanel projects={projects} />
       </section>
 
       {/* Progress section */}
