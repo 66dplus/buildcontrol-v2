@@ -42,6 +42,21 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
     except Exception:
         pass  # column already exists
 
+    # Audit log for agent write-actions (Wave 1 Task 4)
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_type TEXT NOT NULL,
+            params TEXT NOT NULL,
+            result TEXT,
+            status TEXT NOT NULL,
+            executed_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    await conn.commit()
+
     await _dedupe_and_index(conn)
 
 

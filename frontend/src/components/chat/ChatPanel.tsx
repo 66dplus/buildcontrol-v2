@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { streamChat } from "../../lib/sse";
+import { streamChat, type PendingAction } from "../../lib/sse";
 import { MessageBubble, type MessageRole } from "./MessageBubble";
+import { ConfirmActionCard } from "./ConfirmActionCard";
 
 interface ChatMessage {
   id: number;
   role: MessageRole;
   text: string;
+  action?: PendingAction;
 }
 
 interface ChatPanelProps {
@@ -25,6 +27,7 @@ export function ChatPanel({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const ctrlRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const idRef = useRef(0);
@@ -59,6 +62,13 @@ export function ChatPanel({
           prev.map((m) => (m.id === agentId ? { ...m, text: m.text + chunk } : m)),
         );
       },
+      onAction: (action) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === agentId ? { ...m, text: "", action } : m,
+          ),
+        );
+      },
       onDone: () => setStreaming(false),
       onError: (msg) => {
         setMessages((prev) => {
@@ -68,6 +78,37 @@ export function ChatPanel({
         setStreaming(false);
       },
     });
+  }
+
+  async function handleConfirm(action: PendingAction) {
+    setConfirmBusy(true);
+    try {
+      const res = await fetch("/api/agent/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action_id: action.action_id }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        addSystemMsg("error", `Ошибка: ${json.error ?? res.status}`);
+      } else {
+        addSystemMsg("agent", "Действие выполнено успешно.");
+      }
+    } catch (err) {
+      addSystemMsg("error", `Сетевая ошибка: ${(err as Error).message}`);
+    } finally {
+      setConfirmBusy(false);
+      // Remove the action card from the message that triggered it.
+      setMessages((prev) => prev.map((m) => (m.action ? { ...m, action: undefined } : m)));
+    }
+  }
+
+  function handleCancel() {
+    setMessages((prev) => prev.map((m) => (m.action ? { ...m, action: undefined } : m)));
+  }
+
+  function addSystemMsg(role: MessageRole, text: string) {
+    setMessages((prev) => [...prev, { id: nextId(), role, text }]);
   }
 
   function handleKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -89,9 +130,25 @@ export function ChatPanel({
             {greeting}
           </div>
         ) : (
-          messages.map((m) => <MessageBubble key={m.id} role={m.role} text={m.text} />)
+          messages.map((m) =>
+            m.action ? (
+              <div key={m.id} className="flex justify-start">
+                <div className="max-w-[80%]">
+                  <ConfirmActionCard
+                    title={m.action.display.title}
+                    fields={m.action.display.fields}
+                    busy={confirmBusy}
+                    onConfirm={() => handleConfirm(m.action!)}
+                    onCancel={handleCancel}
+                  />
+                </div>
+              </div>
+            ) : (
+              <MessageBubble key={m.id} role={m.role} text={m.text} />
+            ),
+          )
         )}
-        {streaming && messages[messages.length - 1]?.text === "" ? (
+        {streaming && messages[messages.length - 1]?.text === "" && !messages[messages.length - 1]?.action ? (
           <div className="text-muted text-xs" data-testid="chat-thinking">
             …думаю
           </div>

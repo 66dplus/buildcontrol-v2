@@ -10,8 +10,17 @@ export interface SseEvent {
   data: unknown;
 }
 
+export interface PendingAction {
+  action_id: string;
+  display: {
+    title: string;
+    fields: Array<{ label: string; value: string }>;
+  };
+}
+
 export interface ChatStreamHandlers {
   onChunk: (text: string) => void;
+  onAction?: (action: PendingAction) => void;
   onDone?: () => void;
   onError?: (message: string) => void;
 }
@@ -104,6 +113,8 @@ export function streamChat(
           if (ev.event === "chunk") {
             const t = (ev.data as { text?: string })?.text;
             if (typeof t === "string") handlers.onChunk(t);
+          } else if (ev.event === "action") {
+            handlers.onAction?.(ev.data as PendingAction);
           } else if (ev.event === "done") {
             handlers.onDone?.();
             return;

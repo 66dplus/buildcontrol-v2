@@ -2,9 +2,11 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatPanel } from "./ChatPanel";
+import type { PendingAction } from "../../lib/sse";
 
 interface CapturedHandlers {
   onChunk: (text: string) => void;
+  onAction?: (action: PendingAction) => void;
   onDone?: () => void;
   onError?: (msg: string) => void;
 }
@@ -21,6 +23,17 @@ beforeEach(() => {
   captured = null;
   vi.clearAllMocks();
 });
+
+const FAKE_ACTION: PendingAction = {
+  action_id: "test-uuid",
+  display: {
+    title: "Создать задачу: «Тест»",
+    fields: [
+      { label: "Название", value: "Тест" },
+      { label: "Ответственный (ID)", value: "5" },
+    ],
+  },
+};
 
 describe("ChatPanel", () => {
   it("shows the greeting before any messages are sent", () => {
@@ -81,5 +94,55 @@ describe("ChatPanel", () => {
     await user.click(screen.getByTestId("chat-send"));
     captured?.onError?.("сервер упал");
     expect(await screen.findByTestId("message-error")).toHaveTextContent("сервер упал");
+  });
+
+  it("shows ConfirmActionCard when onAction is called", async () => {
+    const user = userEvent.setup();
+    render(<ChatPanel />);
+    await user.type(screen.getByTestId("chat-input"), "создай задачу");
+    await user.click(screen.getByTestId("chat-send"));
+
+    captured?.onAction?.(FAKE_ACTION);
+
+    expect(await screen.findByTestId("confirm-action-card")).toBeInTheDocument();
+    expect(screen.getByText("Создать задачу: «Тест»")).toBeInTheDocument();
+  });
+
+  it("removes ConfirmActionCard on cancel", async () => {
+    const user = userEvent.setup();
+    render(<ChatPanel />);
+    await user.type(screen.getByTestId("chat-input"), "создай задачу");
+    await user.click(screen.getByTestId("chat-send"));
+    captured?.onAction?.(FAKE_ACTION);
+    await screen.findByTestId("confirm-action-card");
+
+    await user.click(screen.getByTestId("cancel-btn"));
+    expect(screen.queryByTestId("confirm-action-card")).not.toBeInTheDocument();
+  });
+
+  it("calls /api/agent/confirm on Confirm click and shows success", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ ok: true, result: {} }),
+      }),
+    );
+
+    render(<ChatPanel />);
+    await user.type(screen.getByTestId("chat-input"), "создай задачу");
+    await user.click(screen.getByTestId("chat-send"));
+    captured?.onAction?.(FAKE_ACTION);
+    await screen.findByTestId("confirm-action-card");
+
+    await user.click(screen.getByTestId("confirm-btn"));
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/agent/confirm",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(await screen.findByText("Действие выполнено успешно.")).toBeInTheDocument();
+    vi.unstubAllGlobals();
   });
 });

@@ -120,4 +120,27 @@ describe("streamChat", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ message: "ping" });
   });
+
+  it("calls onAction when an action event arrives in the stream", async () => {
+    const payload = {
+      action_id: "abc-123",
+      display: { title: "Тест", fields: [{ label: "Название", value: "Задача" }] },
+    };
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      makeStreamingResponse([
+        `event: action\ndata: ${JSON.stringify(payload)}\n\n`,
+        "event: done\ndata: {}\n\n",
+      ]),
+    ) as unknown as typeof fetch;
+
+    let received: unknown = null;
+    let done = false;
+    streamChat("действие", {
+      onChunk: () => {},
+      onAction: (a) => { received = a; },
+      onDone: () => { done = true; },
+    });
+    await vi.waitFor(() => expect(done).toBe(true));
+    expect(received).toEqual(payload);
+  });
 });

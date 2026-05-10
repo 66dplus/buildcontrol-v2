@@ -1840,8 +1840,12 @@ async def api_agent_chat(request: Request) -> StreamingResponse:
 
     async def event_stream():
         try:
-            async for token in stream_director_query(message):
-                yield sse_event({"text": token})
+            async for item in stream_director_query(message):
+                if isinstance(item, dict) and "__action__" in item:
+                    yield sse_event(item["__action__"], event="action")
+                    yield sse_event({}, event="done")
+                    return
+                yield sse_event({"text": item})
             yield sse_event({}, event="done")
         except Exception as exc:
             logger.exception("Agent stream failed: %s", exc)
@@ -1855,6 +1859,34 @@ async def api_agent_chat(request: Request) -> StreamingResponse:
             "X-Accel-Buffering": "no",  # disable nginx buffering for SSE
         },
     )
+
+
+@app.post("/api/agent/confirm")
+async def api_agent_confirm(request: Request) -> JSONResponse:
+    """
+    Execute a pending write-action after director confirmation.
+
+    Body: ``{"action_id": "<uuid>"}``
+    Returns: ``{"ok": true, "result": {...}}`` or ``{"ok": false, "error": "..."}``
+    """
+    from app.agent_tools import execute_pending_action
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    action_id = (body.get("action_id") or "").strip()
+    if not action_id:
+        raise HTTPException(status_code=400, detail="action_id is required")
+
+    result = await execute_pending_action(action_id)
+    if "error" in result:
+        if result["error"] == "action_not_found":
+            raise HTTPException(status_code=404, detail="Action not found or already executed")
+        return JSONResponse({"ok": False, "error": result["error"]}, status_code=500)
+
+    return JSONResponse({"ok": True, "result": result})
 
 
 @app.get("/api/projects/{project_id}/tasks-full")
