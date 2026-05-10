@@ -1,11 +1,8 @@
 """Tests for the tool registry."""
 import asyncio
-import importlib
 
 
 def test_register_adds_tool():
-    import app.agent.tools as pkg
-    importlib.reload(pkg)
     from app.agent.tools import _register, TOOL_REGISTRY
 
     @_register({
