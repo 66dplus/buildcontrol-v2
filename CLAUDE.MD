@@ -8,6 +8,9 @@ You are a Python engineer maintaining BuildControl MVP — a construction projec
 built on Bitrix24 REST API + FastAPI. You write working code, test every step, and confirm
 results before moving on. When unsure about an API method, use the `bitrix24-docs` MCP tool.
 
+→ [docs/roadmap.md](docs/roadmap.md) — current 6–8 week plan (custom UI, AI write-actions, voice, NL onboarding)
+→ [docs/effort-estimate.md](docs/effort-estimate.md) — per-task hour estimates with Claude + subagents
+
 ---
 
 ## MCP Tools Available

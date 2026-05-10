@@ -4,6 +4,9 @@
 
 Construction project management MVP built on top of Bitrix24's REST API. A director uploads an Excel plan → the system creates a Bitrix24 project with structured Universal Lists and CRM tasks → foremen submit daily reports via an embedded iframe widget → fact data rolls up through a cascade to plan/actual comparisons at the task and phase level.
 
+→ [docs/roadmap.md](docs/roadmap.md) — 6–8 week plan to evolve this into a real AI-first product (custom UI, agent write-actions, voice, NL onboarding)
+→ [docs/effort-estimate.md](docs/effort-estimate.md) — per-task hour estimates assuming Claude + subagents
+
 ---
 
 ## How It Works

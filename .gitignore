@@ -44,6 +44,17 @@ env/
 pytest-of-*/
 node-compile-cache/
 .claude/scheduled_tasks.lock
+.coverage
+.coverage.*
+htmlcov/
+
+# Local SQLite dev DB (VPS uses /opt/buildcontrol/buildcontrol.db)
+buildcontrol_local.db
+buildcontrol_local.db-shm
+buildcontrol_local.db-wal
+
+# Superpowers plugin scratch dir
+.superpowers/
 
 # Local ops files with credentials — never commit
 deploy.md
