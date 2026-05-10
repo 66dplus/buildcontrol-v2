@@ -21,52 +21,58 @@ from app.agent_tools import dispatch_write, PENDING_ACTIONS
 
 @pytest.mark.asyncio
 async def test_query_database_rejects_delete() -> None:
-    from app.telegram_agent import _tool_query_database  # type: ignore[attr-defined]
+    import app.agent.tools.read  # noqa: F401 — trigger registration
+    from app.agent.tools.read import _query_database
 
-    result = await _tool_query_database("DELETE FROM projects")
+    result = await _query_database("DELETE FROM projects")
     assert "error" in result
     assert "SELECT" in result["error"]
 
 
 @pytest.mark.asyncio
 async def test_query_database_rejects_insert() -> None:
-    from app.telegram_agent import _tool_query_database  # type: ignore[attr-defined]
+    import app.agent.tools.read  # noqa: F401
+    from app.agent.tools.read import _query_database
 
-    result = await _tool_query_database("INSERT INTO projects (name) VALUES ('x')")
+    result = await _query_database("INSERT INTO projects (name) VALUES ('x')")
     assert "error" in result
 
 
 @pytest.mark.asyncio
 async def test_query_database_rejects_drop() -> None:
-    from app.telegram_agent import _tool_query_database  # type: ignore[attr-defined]
+    import app.agent.tools.read  # noqa: F401
+    from app.agent.tools.read import _query_database
 
-    result = await _tool_query_database("DROP TABLE projects")
+    result = await _query_database("DROP TABLE projects")
     assert "error" in result
 
 
 @pytest.mark.asyncio
 async def test_query_database_accepts_select_returns_list() -> None:
-    from app.telegram_agent import _tool_query_database  # type: ignore[attr-defined]
+    import app.agent.tools.read  # noqa: F401
+    from app.agent.tools.read import _query_database
 
-    result = await _tool_query_database("SELECT 1 AS n")
+    result = await _query_database("SELECT 1 AS n")
     assert isinstance(result, list)
     assert result[0]["n"] == 1
 
 
 @pytest.mark.asyncio
 async def test_query_database_auto_adds_limit() -> None:
-    from app.telegram_agent import _tool_query_database  # type: ignore[attr-defined]
+    import app.agent.tools.read  # noqa: F401
+    from app.agent.tools.read import _query_database
 
-    result = await _tool_query_database("SELECT 1 AS n")
+    result = await _query_database("SELECT 1 AS n")
     # Should not raise; the LIMIT is injected internally.
     assert isinstance(result, list)
 
 
 @pytest.mark.asyncio
 async def test_query_database_returns_error_on_bad_sql() -> None:
-    from app.telegram_agent import _tool_query_database  # type: ignore[attr-defined]
+    import app.agent.tools.read  # noqa: F401
+    from app.agent.tools.read import _query_database
 
-    result = await _tool_query_database("SELECT * FROM nonexistent_table_xyz")
+    result = await _query_database("SELECT * FROM nonexistent_table_xyz")
     assert "error" in result
 
 
@@ -76,9 +82,10 @@ async def test_query_database_returns_error_on_bad_sql() -> None:
 
 @pytest.mark.asyncio
 async def test_list_projects_returns_list() -> None:
-    from app.telegram_agent import _tool_list_projects  # type: ignore[attr-defined]
+    import app.agent.tools.read  # noqa: F401
+    from app.agent.tools.read import _list_projects
 
-    result = await _tool_list_projects()
+    result = await _list_projects()
     assert isinstance(result, list)
     # Each row has id and name.
     for row in result:
@@ -134,14 +141,18 @@ async def test_full_round_trip_add_comment(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_write_tools_are_not_in_read_registry() -> None:
-    """Write tools must NOT be in the Telegram agent's TOOL_REGISTRY."""
-    from app.telegram_agent import TOOL_REGISTRY
-    from app.agent_tools import WRITE_TOOL_REGISTRY
+async def test_agent_tool_registry_has_read_and_write_tools() -> None:
+    """The unified agent TOOL_REGISTRY contains both read and write tools."""
+    import app.agent.tools.read  # noqa: F401
+    import app.agent.tools.create_task  # noqa: F401
+    import app.agent.tools.add_comment  # noqa: F401
+    import app.agent.tools.assign_user  # noqa: F401
+    import app.agent.tools.move_task_stage  # noqa: F401
+    from app.agent.tools import TOOL_REGISTRY, is_write_tool
 
-    write_names = set(WRITE_TOOL_REGISTRY.keys())
-    read_names = set(TOOL_REGISTRY.keys())
-    # Intersection must be empty — no overlap.
-    assert write_names.isdisjoint(read_names), (
-        f"Write tools leaked into read registry: {write_names & read_names}"
-    )
+    read_tools = {name for name in TOOL_REGISTRY if not is_write_tool(name)}
+    write_tools = {name for name in TOOL_REGISTRY if is_write_tool(name)}
+    assert "list_projects" in read_tools
+    assert "query_database" in read_tools
+    assert "create_task" in write_tools
+    assert "add_comment" in write_tools
