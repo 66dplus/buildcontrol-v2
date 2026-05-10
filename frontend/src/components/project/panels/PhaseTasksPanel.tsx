@@ -51,9 +51,13 @@ export function PhaseTasksPanel({ phaseName, tasks }: PhaseTasksPanelProps) {
                 </div>
                 <div className="flex items-center justify-between text-xs text-muted mt-1">
                   <span>{formatPercent(t.completion_pct)} готово</span>
-                  <span className={`tabular ${v > 15 ? "text-warning font-medium" : ""}`}>
-                    {formatMoney(t.budget_plan, { compact: true })} →{" "}
-                    {formatMoney(t.budget_actual, { compact: true })}
+                  <span className="tabular flex items-center gap-2">
+                    <span>План: {formatMoney(t.budget_plan, { compact: true })}</span>
+                    {v !== 0 && (
+                      <span className={v > 15 ? "text-warning font-medium" : v > 0 ? "text-muted" : "text-accent"}>
+                        {v > 0 ? "+" : ""}{formatMoney(t.budget_actual - t.budget_plan, { compact: true })} ({v > 0 ? "+" : ""}{formatPercent(v, 1)})
+                      </span>
+                    )}
                   </span>
                 </div>
               </button>
