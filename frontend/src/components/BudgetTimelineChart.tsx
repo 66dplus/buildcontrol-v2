@@ -107,7 +107,8 @@ const ANOMALY_COLOR: Record<string, string> = {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function AnomalyDot(props: any) {
   const { cx, cy, payload } = props as { cx?: number; cy?: number; payload?: ChartPoint };
-  if (!payload?.anomaly || cx == null || cy == null) {
+  if (cx == null || cy == null) return null;
+  if (!payload?.anomaly) {
     return <circle cx={cx} cy={cy} r={2} fill="#3ba6f1" opacity={0.4} />;
   }
   const color = ANOMALY_COLOR[payload.anomaly] ?? "#3ba6f1";
@@ -208,7 +209,6 @@ export function BudgetTimelineChart({ timeline, category = "total", height = 260
   const todayLabel = fmtDate(todayStr);
 
   const actualKey = CATEGORY_KEY[category];
-  const showPlan = true;
 
   // One tick label per month
   const seenMonths = new Set<string>();
@@ -265,19 +265,17 @@ export function BudgetTimelineChart({ timeline, category = "total", height = 260
             label={{ value: "Сегодня", position: "insideTopRight", fontSize: 10, fill: "#78716c" }}
           />
 
-          {/* Plan line (dashed, only for total) */}
-          {showPlan && (
-            <Line
-              dataKey="plan"
-              name="План"
-              stroke="#94a3b8"
-              strokeWidth={1.5}
-              strokeDasharray="6 3"
-              dot={false}
-              connectNulls
-              isAnimationActive={false}
-            />
-          )}
+          {/* Plan line (dashed) */}
+          <Line
+            dataKey="plan"
+            name="План"
+            stroke="#94a3b8"
+            strokeWidth={1.5}
+            strokeDasharray="6 3"
+            dot={false}
+            connectNulls
+            isAnimationActive={false}
+          />
 
           {/* Actual line with anomaly dots */}
           <Line
