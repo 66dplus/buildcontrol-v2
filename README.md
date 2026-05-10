@@ -74,7 +74,11 @@ The buyer success screen no longer shows an approval link — it just confirms `
 
 ### 3. Foreman Report Form
 
-A Bitrix24 local app embeds an iframe widget at `/bitrix/widget`. The JS:
+Two entry points — the legacy Bitrix24 iframe widget and the new React SPA foreman page (`/foreman-report`).
+
+**React SPA (preferred for standalone host):** Project → Phase → Task cascade selectors load from SQLite. After selecting a task, materials / labor / equipment rows load in parallel. Foreman enters fact quantities and optionally writes a comment, then submits `POST /api/report`.
+
+**Legacy Bitrix24 iframe widget** at `/bitrix/widget`. The JS:
 
 1. Loads active projects via `GET /api/projects`
 2. On project select, loads tasks via `GET /api/projects/{id}/tasks` (root tasks only, no subtasks in dropdown)
@@ -85,12 +89,14 @@ A Bitrix24 local app embeds an iframe widget at `/bitrix/widget`. The JS:
    - **v4 (subtasks present):** updates each subtask's status + dates in the Universal List, recomputes `Готовн. факт, %` as `completed / total × 100`, auto-advances parent Kanban stage, posts auto-generated status lines ("▶️ Подзадача начата: …" / "✅ Подзадача выполнена: …") + foreman's manual comment to parent task chat
    - **v3 (no subtasks):** moves parent task to the selected Kanban stage, calls `tasks.task.start` / `tasks.task.complete` based on stage position, posts comment
 
-### 4. Cascade Update
+### 4. Cascade Update + Budget Snapshot
 
 After each foreman or buyer report, `utils/cascade.py` runs two passes:
 
 - `cascade_update_task()` — sums `Стоим. факт` (materials) + `ФОТ факт` (labor) + `Итого факт` (equipment) for the (Этап, Задача) pair → writes total to `Бюджет факт, ₽` in "2. Этапы и задачи"
 - `cascade_update_budget()` — sums all rows for the Этап across all three resource lists → writes `Материалы факт, ₽`, `ФОТ факт, ₽`, `Техника факт, ₽`, `Итого факт, ₽` to the phase row in "1. Бюджет"
+
+After cascade completes, `app/routes/reports.py` also upserts a row in `budget_snapshots` (one row per project per day), recording the day's running `mat_actual`, `lab_actual`, `eq_actual`, `total_actual` totals. These snapshots power the **Plan vs Fact over Time** chart on the React SPA dashboard and project detail pages.
 
 Additionally, `app/webhook_handler.py` handles task progress in two modes:
 
@@ -108,7 +114,22 @@ Additionally, `app/webhook_handler.py` handles task progress in two modes:
 - Posts a single comment to the parent Bitrix task combining auto-generated status lines ("▶️ Подзадача начата: …" / "✅ Подзадача выполнена: …") and the foreman's manual comment (if provided)
 - Checks for overdue subtasks (`Дата ок. план < today`) and fires Telegram alerts
 
-### 5. Director Telegram Agent
+### 5. React SPA (Director UI)
+
+A Vite + React + TypeScript single-page app served from `frontend/`. It talks only to the FastAPI backend — no direct Bitrix24 calls.
+
+| Page | Route | Key content |
+|------|-------|-------------|
+| Dashboard | `/` | 3 KPI tiles (plan / actual / deviation) + **Plan vs Fact over Time** line chart + behind-schedule banner + project table |
+| Project Detail | `/projects/:id` | Fixed header, 5 tabs: Overview · Stages & Tasks · Materials · Labor · Equipment |
+| AI Chat | `/ai` | Full-height streaming chat (SSE), confirmation cards for write actions |
+| Foreman Report | `/foreman-report` | Cascade selectors → materials / labor / equipment rows |
+
+**Plan vs Fact over Time chart** (`BudgetTimelineChart`): pulls `GET /api/projects/{id}/budget-timeline` (or `/api/dashboard/budget-timeline` for the portfolio view). Shows a dashed plan line (step function derived from `date_start_plan`) and a solid actual line sourced from `budget_snapshots`. Dots on the actual line are colour-coded: 🔴 >10% overrun, 🟡 0–10%, 🟢 under plan. Project Detail adds a category switcher (Total / Materials / Labor / Equipment).
+
+On mount the SPA calls `GET /api/whoami` to detect host: `standalone` enforces cookie auth, `bitrix` uses BX24 token and skips the login redirect.
+
+### 6. Director Telegram Agent
 
 The director can ask natural-language questions in Russian about any project directly in Telegram. The agent uses a **text-to-SQL** approach: it has access to the full schema description and generates SQL queries against the local SQLite database.
 
@@ -164,6 +185,18 @@ SET total_plan   = COALESCE(NULLIF(total_plan,0),   materials_plan+labor_plan+eq
 ## Project Structure
 
 ```
+frontend/
+  src/
+    pages/              # DashboardPage, ProjectDetailPage, AiPage, ForemanPage
+    components/
+      BudgetTimelineChart.tsx   # Plan vs Fact line chart (Recharts ComposedChart)
+      dashboard/        # KpiTile, ProjectTable
+      project/tabs/     # OverviewTab, StagesTab, MaterialsTab, LaborTab, EquipmentTab
+      chat/             # ChatPanel, MessageBubble, ConfirmActionCard
+    lib/
+      api.ts            # Typed fetch wrappers for all /api/* endpoints
+  vite.config.ts        # Dev server proxies /api/* → localhost:8000
+
 bitrix/
   client.py              # All Bitrix24 HTTP calls go here. Handles rate limiting
                          # (0.5s interval + retry on QUERY_LIMIT_EXCEEDED × 5)
@@ -173,8 +206,8 @@ bitrix/
     workgroups.py        # Project (sonet group) creation
 
 db/
-  schema.sql             # CREATE TABLE statements for all 7 tables
-  database.py            # init_db() + get_db() async context manager; registers py_lower()
+  schema.sql             # CREATE TABLE statements — includes budget_snapshots (project_id, date, mat/lab/eq/total_actual)
+  database.py            # init_db() + get_db() async context manager; registers py_lower(); runs migrations
   repo.py                # Thin async query helpers (upsert_*, get_*, cascade_update_*)
   schema_docs.py         # SCHEMA_DOCS string — embedded in Telegram agent system prompt
 
@@ -182,6 +215,7 @@ scripts/
   import_excel.py        # ExcelImporter class — full import orchestrator; dual-writes to SQLite
   migrate_bitrix_to_sqlite.py  # One-time backfill: reads all Bitrix lists → populates SQLite
   test_agent_qa.py       # Runs all 15 QA questions against the live agent (patches Telegram send)
+  seed_demo_data.py      # Seeds 3 demo projects with phases, tasks, and 17 weekly budget_snapshots (S-curve ramp)
 
 utils/
   excel_parser.py        # Reads .xlsx, detects header rows, returns {sheet: [row_dicts]}
@@ -248,8 +282,15 @@ pip install -r requirements.txt
 # Run a test import
 python scripts/import_excel.py template_data/plan_fact_v3.xlsx
 
-# Start the API server locally
+# Seed demo data (3 projects + 17 weekly budget snapshots each)
+python scripts/seed_demo_data.py
+
+# Start the API server
 uvicorn app.webhook_handler:app --reload --port 8000
+
+# Start the React dev server (in a second terminal)
+cd frontend && npm install && npm run dev
+# → http://localhost:5173 (proxies /api/* to port 8000)
 ```
 
 ### Required `.env` keys
@@ -294,7 +335,12 @@ See [prod_info.md](prod_info.md) for full ops details, Cloudflare tunnel setup, 
 |--------|------|-------------|
 | GET | `/health` | Health check |
 | POST | `/upload` | Upload `.xlsx` → pre-validates with openpyxl (400 on parse error) before scheduling background import |
+| GET | `/api/whoami` | Returns `{ user, role, host, capabilities }` — SPA uses `host` to decide auth flow |
+| GET | `/api/dashboard/summary` | Portfolio KPIs + per-project totals aggregated from `budget_phases` |
+| GET | `/api/dashboard/budget-timeline` | Aggregated plan vs actual time series across all active projects |
 | GET | `/api/projects` | List active (non-archived) workgroups |
+| GET | `/api/projects/{id}/phases` | Phase budget rows (materials / labor / equipment plan vs actual) |
+| GET | `/api/projects/{id}/budget-timeline` | Plan vs actual time series from `budget_snapshots`; anomaly annotation per point |
 | GET | `/api/projects/{id}/tasks` | Root tasks from "2. Этапы и задачи" list (deduplicated; includes `bitrix_task_id`) |
 | GET | `/api/projects/{id}/stages` | Kanban stages for a project (sorted by SORT) |
 | GET | `/api/projects/{id}/task-context` | Combined task payload (`materials`, `labor`, `equipment`, `subtasks`) for `?etap=X&zadacha=Y` |

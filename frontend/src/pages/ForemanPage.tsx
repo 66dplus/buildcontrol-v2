@@ -6,7 +6,6 @@ import {
   type ForemanMaterial,
   type ForemanTask,
   type Project,
-  type Stage,
 } from "../lib/api";
 
 // ---------------------------------------------------------------------------
@@ -56,7 +55,7 @@ function ResourceRows<T extends { name: string }>({
             className="w-24 border border-border rounded px-2 py-1 text-xs text-ink bg-bg focus:outline-none focus:border-accent text-right"
           />
           <span className="text-muted text-xs w-8">
-            {"unit" in item ? (item as ForemanMaterial).unit : valueKey === "hours" ? "ч" : ""}
+            {"unit" in item ? (item as unknown as ForemanMaterial).unit : valueKey === "hours" ? "ч" : ""}
           </span>
         </div>
       ))}
@@ -88,10 +87,8 @@ export function ForemanPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
   const [tasks, setTasks] = useState<ForemanTask[]>([]);
-  const [stages, setStages] = useState<Stage[]>([]);
   const [selectedPhase, setSelectedPhase] = useState("");
   const [selectedTask, setSelectedTask] = useState("");
-  const [selectedStageId, setSelectedStageId] = useState<number | null>(null);
 
   // Resource rows
   const [materials, setMaterials] = useState<ForemanMaterial[]>([]);
@@ -114,20 +111,13 @@ export function ForemanPage() {
     api.projects().then(setProjects).catch(() => {});
   }, []);
 
-  // Load tasks + stages when project changes
+  // Load tasks when project changes
   useEffect(() => {
     if (!selectedProjectId) return;
     setTasks([]);
-    setStages([]);
     setSelectedPhase("");
     setSelectedTask("");
-    Promise.all([
-      api.foremanTasks(selectedProjectId),
-      api.stages(selectedProjectId).catch(() => []),
-    ]).then(([t, s]) => {
-      setTasks(t);
-      setStages(s);
-    });
+    api.foremanTasks(selectedProjectId).then(setTasks);
   }, [selectedProjectId]);
 
   // Load resource rows when task is selected
@@ -175,7 +165,6 @@ export function ForemanPage() {
         {
           task_etap: selectedPhase,
           task_zadacha: selectedTask,
-          ...(selectedStageId ? { stage_id: selectedStageId } : {}),
           materials: materials
             .map((m) => ({ name: m.name, quantity: matVals[m.name] ?? 0 }))
             .filter((m) => m.quantity > 0),
@@ -192,12 +181,10 @@ export function ForemanPage() {
     try {
       await api.submitReport(body);
       setToast("Сохранено ✓");
-      // Reset values after successful submit
       setMatVals({});
       setLabVals({});
       setEqVals({});
       setComment("");
-      setSelectedStageId(null);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -286,38 +273,15 @@ export function ForemanPage() {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Дата</label>
-              <input
-                type="date"
-                value={date}
-                onChange={(e) => setDate(e.target.value)}
-                data-testid="date-input"
-                className="w-full border border-border rounded-card px-3 py-2 text-sm text-ink bg-bg focus:outline-none focus:border-accent"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">
-                Перевести на этап
-              </label>
-              <select
-                value={selectedStageId ?? ""}
-                onChange={(e) =>
-                  setSelectedStageId(e.target.value ? Number(e.target.value) : null)
-                }
-                disabled={stages.length === 0}
-                data-testid="stage-select"
-                className="w-full border border-border rounded-card px-3 py-2 text-sm text-ink bg-bg focus:outline-none focus:border-accent disabled:opacity-50"
-              >
-                <option value="">— без изменения —</option>
-                {stages.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.title}
-                  </option>
-                ))}
-              </select>
-            </div>
+          <div>
+            <label className="block text-xs font-medium text-muted mb-1">Дата</label>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              data-testid="date-input"
+              className="w-full border border-border rounded-card px-3 py-2 text-sm text-ink bg-bg focus:outline-none focus:border-accent"
+            />
           </div>
         </div>
 

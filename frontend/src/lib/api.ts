@@ -111,6 +111,7 @@ export interface DashboardKpi {
   total_plan: number;
   total_actual: number;
   anomaly_count: number;
+  behind_count: number;
 }
 
 export interface DashboardSummary {
@@ -181,6 +182,21 @@ export interface ImportStatus {
     task_count: number;
   };
   error?: string;
+}
+
+export interface BudgetTimelinePoint {
+  date: string;
+  total: number;
+  materials?: number;
+  labor?: number;
+  equipment?: number;
+  anomaly?: "red" | "yellow" | "green" | null;
+  variance_pct?: number;
+}
+
+export interface BudgetTimeline {
+  plan_series: Array<{ date: string; total: number }>;
+  actual_series: BudgetTimelinePoint[];
 }
 
 export interface PurchaseRequest {
@@ -299,6 +315,10 @@ export const api = {
       return res.json() as Promise<{ request_id: string; request_no: string }>;
     });
   },
+  budgetTimeline: (projectId: number) =>
+    jsonFetch<BudgetTimeline>(`/api/projects/${projectId}/budget-timeline`),
+  dashboardBudgetTimeline: () =>
+    jsonFetch<BudgetTimeline>("/api/dashboard/budget-timeline"),
   foremanTasks: (projectId: number) =>
     jsonFetch<ForemanTask[]>(`/api/projects/${projectId}/tasks`),
   foremanMaterials: (projectId: number, etap: string, zadacha: string) =>

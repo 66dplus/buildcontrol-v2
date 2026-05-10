@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { OverviewTab } from "./OverviewTab";
-import type { BudgetPhase } from "../../../lib/api";
+import type { BudgetPhase, BudgetTimeline } from "../../../lib/api";
 
 vi.mock("recharts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("recharts")>();
@@ -33,40 +34,44 @@ function phase(overrides: Partial<BudgetPhase> = {}): BudgetPhase {
   };
 }
 
+const EMPTY_TIMELINE: BudgetTimeline = { plan_series: [], actual_series: [] };
+
+const TIMELINE_WITH_DATA: BudgetTimeline = {
+  plan_series: [{ date: "2026-01-01", total: 0 }, { date: "2026-02-01", total: 5_000_000 }],
+  actual_series: [{ date: "2026-01-15", total: 1_000_000 }],
+};
+
 describe("OverviewTab", () => {
-  it("renders both the chart and the breakdown table when phases exist", () => {
-    render(<OverviewTab phases={[phase()]} />);
+  it("renders the overview tab with overall totals", () => {
+    render(<OverviewTab phases={[phase()]} timeline={EMPTY_TIMELINE} />);
     expect(screen.getByTestId("overview-tab")).toBeInTheDocument();
-    expect(screen.getByTestId("phase-chart")).toBeInTheDocument();
-    expect(screen.getByTestId("phase-breakdown")).toBeInTheDocument();
+    expect(screen.getByText("Итого по проекту")).toBeInTheDocument();
   });
 
-  it("highlights overrun phase rows with warning background", () => {
-    render(
-      <OverviewTab
-        phases={[
-          phase({ id: 1, phase_name: "OK", total_plan: 100, total_actual: 105 }),
-          phase({ id: 2, phase_name: "Bad", total_plan: 100, total_actual: 130 }),
-        ]}
-      />,
-    );
-    expect(screen.getByTestId("phase-row-1").className).not.toContain("bg-warning");
-    expect(screen.getByTestId("phase-row-2").className).toContain("bg-warning");
+  it("shows category switcher tabs", () => {
+    render(<OverviewTab phases={[phase()]} timeline={EMPTY_TIMELINE} />);
+    expect(screen.getByTestId("category-tab-total")).toBeInTheDocument();
+    expect(screen.getByTestId("category-tab-materials")).toBeInTheDocument();
+    expect(screen.getByTestId("category-tab-labor")).toBeInTheDocument();
+    expect(screen.getByTestId("category-tab-equipment")).toBeInTheDocument();
   });
 
-  it("renders one table row per phase", () => {
-    render(
-      <OverviewTab
-        phases={[
-          phase({ id: 1, phase_name: "Каркас" }),
-          phase({ id: 2, phase_name: "Отделка" }),
-          phase({ id: 3, phase_name: "Кровля" }),
-        ]}
-      />,
-    );
-    const table = screen.getByTestId("phase-breakdown");
-    const rows = within(table).getAllByRole("row");
-    // 1 header row + 3 data rows
-    expect(rows).toHaveLength(4);
+  it("renders the recharts container for the timeline chart when data is present", () => {
+    render(<OverviewTab phases={[phase()]} timeline={TIMELINE_WITH_DATA} />);
+    expect(screen.getByTestId("rc-container")).toBeInTheDocument();
+  });
+
+  it("switches category when a tab is clicked", async () => {
+    const user = userEvent.setup();
+    render(<OverviewTab phases={[phase()]} timeline={EMPTY_TIMELINE} />);
+    await user.click(screen.getByTestId("category-tab-materials"));
+    // Category tab is now visually active (no testid for that, just verify no crash)
+    expect(screen.getByTestId("overview-tab")).toBeInTheDocument();
+  });
+
+  it("shows empty state when no phases", () => {
+    render(<OverviewTab phases={[]} timeline={EMPTY_TIMELINE} />);
+    expect(screen.getByTestId("overview-tab")).toBeInTheDocument();
+    expect(screen.getByText("Нет данных по этапам")).toBeInTheDocument();
   });
 });

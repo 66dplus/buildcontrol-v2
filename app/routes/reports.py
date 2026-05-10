@@ -1122,6 +1122,31 @@ async def api_report(request: Request, background: BackgroundTasks) -> JSONRespo
                     await repo.cascade_phase_budget(db_conn, project_id, etap)
                 except Exception as e:
                     logger.warning(f"SQLite cascade_phase_budget [{etap}] failed: {e}")
+
+            # Write a budget snapshot for today so the timeline chart has data
+            try:
+                from datetime import date as _today_date
+                today_str = _today_date.today().isoformat()
+                phases = await repo.get_budget_phases(db_conn, project_id)
+                snap_mat = sum(ph.get("materials_actual") or 0 for ph in phases)
+                snap_lab = sum(ph.get("labor_actual") or 0 for ph in phases)
+                snap_eq  = sum(ph.get("equipment_actual") or 0 for ph in phases)
+                snap_tot = sum(ph.get("total_actual") or 0 for ph in phases)
+                await db_conn.execute(
+                    """
+                    INSERT INTO budget_snapshots(project_id, snapshot_date, mat_actual, lab_actual, eq_actual, total_actual)
+                    VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(project_id, snapshot_date) DO UPDATE SET
+                        mat_actual=excluded.mat_actual,
+                        lab_actual=excluded.lab_actual,
+                        eq_actual=excluded.eq_actual,
+                        total_actual=excluded.total_actual
+                    """,
+                    (project_id, today_str, snap_mat, snap_lab, snap_eq, snap_tot),
+                )
+                await db_conn.commit()
+            except Exception as e:
+                logger.warning(f"Budget snapshot write failed for project {project_id}: {e}")
     except Exception as e:
         logger.error(f"Report SQLite write failed for project {project_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

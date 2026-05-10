@@ -48,7 +48,7 @@ describe("PortfolioChart", () => {
   it("renders the chart container and title when projects exist", () => {
     render(<PortfolioChart projects={makeProjects(2)} />);
     expect(screen.getByTestId("portfolio-chart")).toBeInTheDocument();
-    expect(screen.getByText("Портфель проектов")).toBeInTheDocument();
+    expect(screen.getByText("По проектам")).toBeInTheDocument();
     expect(screen.getByTestId("rc-container")).toBeInTheDocument();
   });
 });
@@ -72,10 +72,11 @@ describe("buildPortfolioRows", () => {
     expect(rows).toHaveLength(3);
     expect(rows[0]).toMatchObject({
       name: "Проект 1",
-      Материалы: 10_000_000,
-      Труд: 5_000_000,
-      Техника: 2_000_000,
-      факт: 18_300_000,
+      plan: 17_000_000,
+      actual: 18_300_000,
+      mat_plan: 10_000_000,
+      lab_plan: 5_000_000,
+      eq_plan: 2_000_000,
     });
   });
 });

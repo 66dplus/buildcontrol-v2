@@ -57,6 +57,7 @@ function mockEndpoints({ projects = PROJECTS, phases = PHASES, tasks = TASKS, ma
       [/\/api\/projects\/\d+\/materials-all/, materials],
       [/\/api\/projects\/\d+\/labor-all/, labor],
       [/\/api\/projects\/\d+\/equipment-all/, equipment],
+      [/\/api\/projects\/\d+\/budget-timeline$/, { plan_series: [], actual_series: [] }],
       [/\/api\/projects$/, projects],
     ];
     for (const [re, body] of map) {
@@ -101,7 +102,7 @@ describe("ProjectDetailPage", () => {
     await waitFor(() => expect(screen.getByTestId("project-detail")).toBeInTheDocument());
     expect(screen.getByText("Тестовый проект")).toBeInTheDocument();
     expect(screen.getByTestId("tab-content-overview")).toBeInTheDocument();
-    expect(screen.getByTestId("phase-chart")).toBeInTheDocument();
+    expect(screen.getByText("Итого по проекту")).toBeInTheDocument();
   });
 
   it("switches tabs when a tab is clicked", async () => {

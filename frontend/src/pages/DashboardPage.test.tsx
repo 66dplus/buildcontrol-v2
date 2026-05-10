@@ -4,7 +4,6 @@ import { MemoryRouter } from "react-router-dom";
 import { DashboardPage } from "./DashboardPage";
 import type { DashboardSummary } from "../lib/api";
 
-// Mock recharts ResponsiveContainer (jsdom can't measure SVG width).
 vi.mock("recharts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("recharts")>();
   return {
@@ -17,12 +16,15 @@ vi.mock("recharts", async (importOriginal) => {
   };
 });
 
+const EMPTY_TIMELINE = { plan_series: [], actual_series: [] };
+
 function summary(overrides: Partial<DashboardSummary> = {}): DashboardSummary {
   return {
     kpi: {
       total_plan: 30_000_000,
       total_actual: 31_500_000,
       anomaly_count: 0,
+      behind_count: 0,
     },
     projects: [
       {
@@ -44,14 +46,23 @@ function summary(overrides: Partial<DashboardSummary> = {}): DashboardSummary {
   };
 }
 
-function mockFetch(body: unknown, status = 200) {
-  globalThis.fetch = vi.fn().mockImplementation(
-    async () =>
-      new Response(JSON.stringify(body), {
-        status,
+function mockEndpoints(summaryData = summary()) {
+  globalThis.fetch = vi.fn().mockImplementation(async (input: RequestInfo) => {
+    const url = String(input);
+    if (/\/api\/dashboard\/budget-timeline/.test(url)) {
+      return new Response(JSON.stringify(EMPTY_TIMELINE), {
+        status: 200,
         headers: { "Content-Type": "application/json" },
-      }),
-  ) as unknown as typeof fetch;
+      });
+    }
+    if (/\/api\/dashboard\/summary/.test(url)) {
+      return new Response(JSON.stringify(summaryData), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("not mocked: " + url, { status: 500 });
+  }) as unknown as typeof fetch;
 }
 
 function renderPage() {
@@ -68,46 +79,45 @@ beforeEach(() => {
 
 describe("DashboardPage", () => {
   it("shows the loading state immediately on mount", () => {
-    mockFetch(summary());
+    mockEndpoints();
     renderPage();
     expect(screen.getByTestId("dashboard-loading")).toBeInTheDocument();
   });
 
-  it("renders KPI tiles, chart and table after data loads", async () => {
-    mockFetch(summary());
+  it("renders KPI tiles, timeline chart and table after data loads", async () => {
+    mockEndpoints();
     renderPage();
     await waitFor(() =>
       expect(screen.getByTestId("dashboard")).toBeInTheDocument(),
     );
     const tiles = screen.getAllByTestId("kpi-tile");
     expect(tiles).toHaveLength(3);
-    expect(tiles[0]).toHaveTextContent("Бюджет план");
-    expect(tiles[1]).toHaveTextContent("Бюджет факт");
-    expect(tiles[2]).toHaveTextContent("Аномалии");
-    expect(screen.getByTestId("portfolio-chart")).toBeInTheDocument();
+    expect(tiles[0]).toHaveTextContent("Итого план");
+    expect(tiles[1]).toHaveTextContent("Итого факт");
+    expect(tiles[2]).toHaveTextContent("Отклонение");
     expect(screen.getByTestId("project-table")).toBeInTheDocument();
     expect(screen.getByText("Торговый центр")).toBeInTheDocument();
   });
 
-  it("does NOT render the anomaly banner when count is zero", async () => {
-    mockFetch(summary({ kpi: { total_plan: 100, total_actual: 100, anomaly_count: 0 } }));
+  it("shows on-track banner when behind_count is zero", async () => {
+    mockEndpoints(summary({ kpi: { total_plan: 100, total_actual: 100, anomaly_count: 0, behind_count: 0 } }));
     renderPage();
     await waitFor(() =>
       expect(screen.getByTestId("dashboard")).toBeInTheDocument(),
     );
-    expect(screen.queryByTestId("anomaly-banner")).not.toBeInTheDocument();
+    expect(screen.getByTestId("on-track-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("behind-banner")).not.toBeInTheDocument();
   });
 
-  it("renders the anomaly banner with the count when count > 0", async () => {
-    mockFetch(
-      summary({ kpi: { total_plan: 100, total_actual: 200, anomaly_count: 3 } }),
+  it("renders the behind banner with the count when behind_count > 0", async () => {
+    mockEndpoints(
+      summary({ kpi: { total_plan: 100, total_actual: 200, anomaly_count: 3, behind_count: 2 } }),
     );
     renderPage();
-    await waitFor(() => expect(screen.getByTestId("anomaly-banner")).toBeInTheDocument());
-    const banner = screen.getByTestId("anomaly-banner");
-    expect(banner).toHaveTextContent("3");
-    expect(banner).toHaveTextContent(/перерасход/i);
-    expect(banner.getAttribute("href")).toBe("/ai");
+    await waitFor(() => expect(screen.getByTestId("behind-banner")).toBeInTheDocument());
+    const banner = screen.getByTestId("behind-banner");
+    expect(banner).toHaveTextContent("2");
+    expect(banner).toHaveTextContent(/отстают от графика/i);
   });
 
   it("renders an error state when the request fails", async () => {
@@ -126,7 +136,7 @@ describe("DashboardPage", () => {
   });
 
   it("singularises 'проект' for one project", async () => {
-    mockFetch(summary());
+    mockEndpoints();
     renderPage();
     await waitFor(() =>
       expect(screen.getByText(/Портфель: 1 проект$/)).toBeInTheDocument(),

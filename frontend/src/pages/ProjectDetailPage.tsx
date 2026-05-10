@@ -3,6 +3,7 @@ import { useParams } from "react-router-dom";
 import {
   api,
   type BudgetPhase,
+  type BudgetTimeline,
   type EquipmentRow,
   type LaborRow,
   type MaterialRow,
@@ -24,6 +25,7 @@ interface ProjectBundle {
   materials: MaterialRow[];
   labor: LaborRow[];
   equipment: EquipmentRow[];
+  timeline: BudgetTimeline;
 }
 
 type LoadState =
@@ -51,8 +53,9 @@ export function ProjectDetailPage() {
       api.materials(projectId),
       api.labor(projectId),
       api.equipment(projectId),
+      api.budgetTimeline(projectId),
     ])
-      .then(([projects, phases, tasks, materials, labor, equipment]) => {
+      .then(([projects, phases, tasks, materials, labor, equipment, timeline]) => {
         if (cancelled) return;
         const proj = projects.find((p) => p.id === projectId);
         setState({
@@ -64,6 +67,7 @@ export function ProjectDetailPage() {
             materials,
             labor,
             equipment,
+            timeline,
           },
         });
       })
@@ -116,7 +120,7 @@ export function ProjectDetailPage() {
       />
       <TabBar active={tab} onChange={setTab} />
       <div data-testid={`tab-content-${tab}`}>
-        {tab === "overview" && <OverviewTab phases={data.phases} />}
+        {tab === "overview" && <OverviewTab phases={data.phases} timeline={data.timeline} />}
         {tab === "stages" && <StagesTab tasks={data.tasks} />}
         {tab === "materials" && <MaterialsTab materials={data.materials} />}
         {tab === "labor" && <LaborTab rows={data.labor} />}
