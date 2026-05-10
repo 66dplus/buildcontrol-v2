@@ -68,7 +68,17 @@ function buildChartData(timeline: BudgetTimeline): ChartPoint[] {
     return last;
   }
 
-  const actualMap = new Map(actual_series.map((a) => [a.date, a]));
+  // Ensure actual values never decrease (guard against bad snapshot data)
+  const sortedActuals = [...actual_series].sort((a, b) => a.date.localeCompare(b.date));
+  let runMax = 0, runMatMax = 0, runLabMax = 0, runEqMax = 0;
+  const cleanedActuals = sortedActuals.map((a) => {
+    runMax = Math.max(runMax, a.total ?? 0);
+    runMatMax = Math.max(runMatMax, a.materials ?? 0);
+    runLabMax = Math.max(runLabMax, a.labor ?? 0);
+    runEqMax = Math.max(runEqMax, a.equipment ?? 0);
+    return { ...a, total: runMax, materials: runMatMax, labor: runLabMax, equipment: runEqMax };
+  });
+  const actualMap = new Map(cleanedActuals.map((a) => [a.date, a]));
 
   return dates.map((date) => {
     const actual = actualMap.get(date);
@@ -198,7 +208,18 @@ export function BudgetTimelineChart({ timeline, category = "total", height = 260
   const todayLabel = fmtDate(todayStr);
 
   const actualKey = CATEGORY_KEY[category];
-  const showPlan = category === "total";
+  const showPlan = true;
+
+  // One tick label per month
+  const seenMonths = new Set<string>();
+  const monthTicks = data
+    .filter((pt) => {
+      const monthKey = pt.date.slice(0, 7);
+      if (seenMonths.has(monthKey)) return false;
+      seenMonths.add(monthKey);
+      return true;
+    })
+    .map((pt) => pt.label);
 
   if (data.length === 0) {
     return (
@@ -219,6 +240,7 @@ export function BudgetTimelineChart({ timeline, category = "total", height = 260
           <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
           <XAxis
             dataKey="label"
+            ticks={monthTicks}
             tick={{ fontSize: 11, fill: "#78716c" }}
             tickLine={false}
             axisLine={false}
