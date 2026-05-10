@@ -3,6 +3,10 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QuickAskModal } from "./QuickAskModal";
 
+vi.mock("../../lib/sse", () => ({
+  streamChat: vi.fn(() => new AbortController()),
+}));
+
 describe("QuickAskModal", () => {
   it("does not render when closed", () => {
     render(<QuickAskModal open={false} onClose={() => {}} />);
@@ -29,5 +33,10 @@ describe("QuickAskModal", () => {
       fireEvent.keyDown(window, { key: "Escape" });
     });
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("renders the embedded ChatPanel when open", () => {
+    render(<QuickAskModal open onClose={() => {}} />);
+    expect(screen.getByTestId("chat-panel")).toBeInTheDocument();
   });
 });

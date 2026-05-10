@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { ChatPanel } from "./ChatPanel";
 
 interface Props {
   open: boolean;
@@ -26,7 +27,7 @@ export function QuickAskModal({ open, onClose }: Props) {
       onClick={onClose}
     >
       <div
-        className="bg-surface rounded-card-lg shadow-card w-[640px] max-w-[92vw] max-h-[480px] overflow-hidden border border-border"
+        className="bg-surface rounded-card-lg shadow-card w-[640px] max-w-[92vw] h-[480px] overflow-hidden border border-border flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-5 py-4 border-b border-border flex items-center justify-between">
@@ -40,8 +41,11 @@ export function QuickAskModal({ open, onClose }: Props) {
             ×
           </button>
         </div>
-        <div className="p-5 text-sm text-muted">
-          Чат-панель будет здесь (Slice 4).
+        <div className="flex-1 overflow-hidden">
+          <ChatPanel
+            greeting="Быстрый вопрос — без покидания текущего экрана."
+            placeholder="Спросите про этот проект…"
+          />
         </div>
       </div>
     </div>
