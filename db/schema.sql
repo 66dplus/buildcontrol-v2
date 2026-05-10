@@ -128,3 +128,30 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project
     ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_pr_project_status
     ON purchase_requests(project_id, status);
+
+CREATE TABLE IF NOT EXISTS budget_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    snapshot_date TEXT NOT NULL,   -- YYYY-MM-DD
+    mat_actual    REAL DEFAULT 0,
+    lab_actual    REAL DEFAULT 0,
+    eq_actual     REAL DEFAULT 0,
+    total_actual  REAL DEFAULT 0,
+    UNIQUE(project_id, snapshot_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_project_date
+    ON budget_snapshots(project_id, snapshot_date);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    session_id TEXT,
+    tool_name TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    result_json TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_session ON audit_log(session_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
