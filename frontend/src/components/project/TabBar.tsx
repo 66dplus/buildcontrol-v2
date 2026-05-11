@@ -23,7 +23,7 @@ export function TabBar({ active, onChange }: TabBarProps) {
     <div
       role="tablist"
       aria-label="Project sections"
-      className="flex items-center gap-1 border-b border-border bg-surface rounded-card-lg px-2"
+      className="flex items-center gap-1 border-b border-border bg-surface rounded-card-lg px-2 overflow-x-auto whitespace-nowrap"
       data-testid="tab-bar"
     >
       {PROJECT_TABS.map((t) => {
@@ -36,7 +36,7 @@ export function TabBar({ active, onChange }: TabBarProps) {
             aria-selected={isActive}
             data-testid={`tab-${t.key}`}
             onClick={() => onChange(t.key)}
-            className={`px-4 py-3 text-sm font-medium transition-colors -mb-px border-b-2 ${
+            className={`px-4 py-3 min-h-11 text-sm font-medium transition-colors -mb-px border-b-2 flex-shrink-0 ${
               isActive
                 ? "text-accent border-accent"
                 : "text-muted hover:text-ink border-transparent"

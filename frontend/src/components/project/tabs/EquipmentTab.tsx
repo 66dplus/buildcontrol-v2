@@ -129,8 +129,8 @@ export function EquipmentTab({ rows, timeline }: EquipmentTabProps) {
       ) : view === "chart" ? (
         <EquipmentChart rows={rows} />
       ) : (
-        <div className="bg-surface border border-border rounded-card overflow-hidden shadow-card">
-          <table className="w-full text-sm">
+        <div className="bg-surface border border-border rounded-card overflow-x-auto shadow-card">
+          <table className="w-full text-sm min-w-[760px]">
             <thead className="bg-bg border-b border-border text-muted text-xs uppercase tracking-wide">
               <tr>
                 <th className="px-4 py-3 text-left font-medium">Техника</th>

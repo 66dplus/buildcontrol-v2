@@ -39,17 +39,19 @@ export function ProjectHeader({ name, totals }: ProjectHeaderProps) {
       className="bg-surface border border-border rounded-card p-5 shadow-card flex flex-col gap-3"
       data-testid="project-header"
     >
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 min-w-0">
         <Link
           to="/"
-          className="text-sm text-muted hover:text-ink"
+          className="text-sm text-muted hover:text-ink min-h-11 flex items-center flex-shrink-0"
           data-testid="back-link"
         >
-          ← Дашборд
+          ←&nbsp;<span className="hidden sm:inline">Дашборд</span>
         </Link>
-        <h1 className="font-heading text-2xl text-ink flex-1">{name}</h1>
+        <h1 className="font-heading text-lg md:text-2xl text-ink flex-1 truncate min-w-0">
+          {name}
+        </h1>
         <span
-          className={`inline-block text-xs px-3 py-1 rounded-pill border ${badge.className}`}
+          className={`inline-block text-xs px-3 py-1 rounded-pill border flex-shrink-0 ${badge.className}`}
         >
           {badge.label}
         </span>
