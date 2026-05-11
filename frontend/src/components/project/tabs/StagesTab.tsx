@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { TaskRow } from "../../../lib/api";
-import { formatMoney, formatPercent, variancePct } from "../../../lib/format";
+import { formatMoney, formatPercent, variancePct, varianceTier, TIER_ROW_BG, TIER_ICON } from "../../../lib/format";
 import { useSidePanel } from "../../../contexts/SidePanelContext";
 import { PhaseTasksPanel } from "../panels/PhaseTasksPanel";
 
@@ -73,7 +73,8 @@ export function StagesTab({ tasks }: StagesTabProps) {
         <tbody>
           {phases.map((p) => {
             const v = variancePct(p.totalPlan, p.totalActual);
-            const overrun = v > 15;
+            const tier = varianceTier(v);
+            const icon = TIER_ICON[tier];
             return (
               <tr
                 key={p.name}
@@ -81,9 +82,7 @@ export function StagesTab({ tasks }: StagesTabProps) {
                   openPanel(<PhaseTasksPanel phaseName={p.name} tasks={p.tasks} />)
                 }
                 data-testid={`stage-row-${p.name}`}
-                className={`border-b border-border last:border-0 hover:bg-bg cursor-pointer transition-colors ${
-                  overrun ? "border-l-4 border-l-warning" : ""
-                }`}
+                className={`border-b border-border last:border-0 hover:bg-bg cursor-pointer transition-colors ${TIER_ROW_BG[tier]}`}
               >
                 <td className="px-4 py-3 text-ink font-medium">{p.name}</td>
                 <td className="px-4 py-3 text-right tabular text-ink">
@@ -100,9 +99,10 @@ export function StagesTab({ tasks }: StagesTabProps) {
                 </td>
                 <td
                   className={`px-4 py-3 text-right tabular font-medium ${
-                    overrun ? "text-warning" : "text-ink"
+                    tier === "high" ? "text-warning" : "text-ink"
                   }`}
                 >
+                  {icon && <span className="mr-1">{icon}</span>}
                   {v > 0 ? "+" : ""}
                   {formatPercent(v, 1)}
                 </td>

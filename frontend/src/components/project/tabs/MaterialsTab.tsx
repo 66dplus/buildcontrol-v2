@@ -4,7 +4,7 @@ import {
   ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
 import type { MaterialRow } from "../../../lib/api";
-import { formatQty } from "../../../lib/format";
+import { formatQty, varianceTier, TIER_ROW_BG, TIER_ICON } from "../../../lib/format";
 import { useSidePanel } from "../../../contexts/SidePanelContext";
 import { MaterialDetailPanel } from "../panels/MaterialDetailPanel";
 
@@ -110,19 +110,18 @@ export function MaterialsTab({ materials }: MaterialsTabProps) {
             </thead>
             <tbody>
               {materials.map((m) => {
-                const overused = m.qty_plan > 0 && m.qty_consumed > m.qty_plan * 1.05;
                 const devPct =
                   m.qty_plan > 0
                     ? ((m.qty_consumed - m.qty_plan) / m.qty_plan) * 100
                     : 0;
+                const tier = varianceTier(devPct);
+                const icon = TIER_ICON[tier];
                 return (
                   <tr
                     key={m.id}
                     onClick={() => openPanel(<MaterialDetailPanel material={m} />)}
                     data-testid={`material-row-${m.id}`}
-                    className={`border-b border-border last:border-0 hover:bg-bg cursor-pointer transition-colors ${
-                      overused ? "bg-warning/5" : ""
-                    }`}
+                    className={`border-b border-border last:border-0 hover:bg-bg cursor-pointer transition-colors ${TIER_ROW_BG[tier]}`}
                   >
                     <td className="px-4 py-3 text-ink font-medium">{m.material_name}</td>
                     <td className="px-4 py-3 text-muted">
@@ -136,9 +135,10 @@ export function MaterialsTab({ materials }: MaterialsTabProps) {
                     <td className="px-4 py-3 text-right tabular text-ink">{formatQty(m.qty_stock)}</td>
                     <td
                       className={`px-4 py-3 text-right tabular font-medium ${
-                        overused ? "text-warning" : "text-ink"
+                        tier === "high" ? "text-warning" : "text-ink"
                       }`}
                     >
+                      {icon && <span className="mr-1">{icon}</span>}
                       {devPct > 0 ? "+" : ""}{devPct.toFixed(1)}%
                     </td>
                   </tr>

@@ -52,3 +52,26 @@ export function formatHours(value: number): string {
   const rounded = parseFloat(n.toFixed(1));
   return rounded % 1 === 0 ? `${rounded.toFixed(0)} ч` : `${rounded} ч`;
 }
+
+export type VarianceTier = "none" | "low" | "mid" | "high";
+
+export function varianceTier(pct: number): VarianceTier {
+  if (!Number.isFinite(pct) || pct <= 0) return "none";
+  if (pct <= 3) return "low";
+  if (pct <= 8) return "mid";
+  return "high";
+}
+
+export const TIER_ROW_BG: Record<VarianceTier, string> = {
+  none: "",
+  low: "bg-yellow-50",
+  mid: "bg-orange-50",
+  high: "bg-red-50",
+};
+
+export const TIER_ICON: Record<VarianceTier, string> = {
+  none: "",
+  low: "",
+  mid: "⚠",
+  high: "⚠",
+};

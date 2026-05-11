@@ -4,7 +4,7 @@ import {
   ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
 import type { LaborRow } from "../../../lib/api";
-import { formatMoney, formatPercent, formatHours, variancePct } from "../../../lib/format";
+import { formatMoney, formatPercent, formatHours, variancePct, varianceTier, TIER_ROW_BG, TIER_ICON } from "../../../lib/format";
 
 interface LaborTabProps {
   rows: LaborRow[];
@@ -100,14 +100,13 @@ export function LaborTab({ rows }: LaborTabProps) {
             <tbody>
               {rows.map((r) => {
                 const v = variancePct(r.payroll_plan, r.payroll_actual);
-                const overrun = v > 15;
+                const tier = varianceTier(v);
+                const icon = TIER_ICON[tier];
                 return (
                   <tr
                     key={r.id}
                     data-testid={`labor-row-${r.id}`}
-                    className={`border-b border-border last:border-0 ${
-                      overrun ? "bg-warning/5" : ""
-                    }`}
+                    className={`border-b border-border last:border-0 ${TIER_ROW_BG[tier]}`}
                   >
                     <td className="px-4 py-3 text-ink font-medium">{r.specialty}</td>
                     <td className="px-4 py-3 text-muted">
@@ -133,9 +132,10 @@ export function LaborTab({ rows }: LaborTabProps) {
                     </td>
                     <td
                       className={`px-4 py-3 text-right tabular font-medium ${
-                        overrun ? "text-warning" : "text-ink"
+                        tier === "high" ? "text-warning" : "text-ink"
                       }`}
                     >
+                      {icon && <span className="mr-1">{icon}</span>}
                       {v > 0 ? "+" : ""}
                       {formatPercent(v, 1)}
                     </td>
