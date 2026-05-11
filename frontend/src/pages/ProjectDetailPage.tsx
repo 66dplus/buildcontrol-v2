@@ -122,9 +122,9 @@ export function ProjectDetailPage() {
       <div data-testid={`tab-content-${tab}`}>
         {tab === "overview" && <OverviewTab phases={data.phases} timeline={data.timeline} />}
         {tab === "stages" && <StagesTab tasks={data.tasks} />}
-        {tab === "materials" && <MaterialsTab materials={data.materials} />}
-        {tab === "labor" && <LaborTab rows={data.labor} />}
-        {tab === "equipment" && <EquipmentTab rows={data.equipment} />}
+        {tab === "materials" && <MaterialsTab materials={data.materials} timeline={data.timeline} />}
+        {tab === "labor" && <LaborTab rows={data.labor} timeline={data.timeline} />}
+        {tab === "equipment" && <EquipmentTab rows={data.equipment} timeline={data.timeline} />}
       </div>
     </div>
   );

@@ -1,15 +1,17 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip,
   ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import type { MaterialRow } from "../../../lib/api";
+import type { BudgetTimeline, MaterialRow } from "../../../lib/api";
 import { formatQty, varianceTier, TIER_ROW_BG, TIER_ICON } from "../../../lib/format";
 import { useSidePanel } from "../../../contexts/SidePanelContext";
 import { MaterialDetailPanel } from "../panels/MaterialDetailPanel";
+import { BudgetTimelineChart } from "../../BudgetTimelineChart";
 
 interface MaterialsTabProps {
   materials: MaterialRow[];
+  timeline?: BudgetTimeline;
 }
 
 function fmtCompact(n: number): string {
@@ -55,9 +57,16 @@ function MaterialsChart({ materials }: { materials: MaterialRow[] }) {
   );
 }
 
-export function MaterialsTab({ materials }: MaterialsTabProps) {
+export function MaterialsTab({ materials, timeline }: MaterialsTabProps) {
   const { openPanel } = useSidePanel();
-  const [view, setView] = useState<"table" | "chart">("table");
+  const [view, setView] = useState<"table" | "chart" | "timeline">("table");
+  const [selectedItem, setSelectedItem] = useState<string>("__all__");
+
+  const itemNames = useMemo(() => {
+    const set = new Set<string>();
+    materials.forEach((m) => set.add(m.material_name));
+    return Array.from(set).sort((a, b) => a.localeCompare(b, "ru"));
+  }, [materials]);
 
   if (materials.length === 0) {
     return (
@@ -74,24 +83,57 @@ export function MaterialsTab({ materials }: MaterialsTabProps) {
     <div className="flex flex-col gap-3" data-testid="materials-tab">
       <div className="flex justify-end">
         <div className="flex gap-1 p-0.5 bg-bg border border-border rounded-pill text-xs">
-          {(["table", "chart"] as const).map((v) => (
+          {(["table", "chart", "timeline"] as const).map((v) => (
             <button
               key={v}
               type="button"
               onClick={() => setView(v)}
-              className={`px-3 py-1 rounded-pill transition-colors ${
+              className={`px-3 py-1 min-h-11 rounded-pill transition-colors ${
                 view === v
                   ? "bg-surface text-ink font-medium shadow-card"
                   : "text-muted hover:text-ink"
               }`}
             >
-              {v === "table" ? "Таблица" : "График"}
+              {v === "table" ? "Таблица" : v === "chart" ? "График" : "Динамика"}
             </button>
           ))}
         </div>
       </div>
 
-      {view === "chart" ? (
+      {view === "timeline" ? (
+        <div className="bg-surface border border-border rounded-card p-4 shadow-card">
+          <div className="flex items-center gap-3 mb-3">
+            <label className="text-xs text-muted">Показать:</label>
+            <select
+              value={selectedItem}
+              onChange={(e) => setSelectedItem(e.target.value)}
+              className="text-sm border border-border bg-bg rounded-card px-2 py-1 text-ink focus:outline-none focus:border-accent"
+            >
+              <option value="__all__">Все материалы</option>
+              {itemNames.map((n) => (
+                <option key={n} value={n} disabled title="Историчность по конкретной позиции появится после расширения снапшотов">
+                  {n} (нет историчности)
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-4 text-xs text-muted mb-3 flex-wrap">
+            <span className="flex items-center gap-1.5">
+              <span style={{ display: "inline-block", width: 24, borderTop: "2px dashed #94a3b8" }} />
+              План
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span style={{ display: "inline-block", width: 24, borderTop: "2px solid #3ba6f1" }} />
+              Факт
+            </span>
+          </div>
+          {timeline ? (
+            <BudgetTimelineChart timeline={timeline} category="materials" height={260} />
+          ) : (
+            <div className="text-muted text-sm">Нет данных динамики</div>
+          )}
+        </div>
+      ) : view === "chart" ? (
         <MaterialsChart materials={materials} />
       ) : (
         <div className="bg-surface border border-border rounded-card overflow-hidden shadow-card">

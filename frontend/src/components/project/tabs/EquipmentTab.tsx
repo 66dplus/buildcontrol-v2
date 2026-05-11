@@ -1,13 +1,15 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip,
   ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import type { EquipmentRow } from "../../../lib/api";
+import type { BudgetTimeline, EquipmentRow } from "../../../lib/api";
 import { formatMoney, formatPercent, formatHours, variancePct, varianceTier, TIER_ROW_BG, TIER_ICON } from "../../../lib/format";
+import { BudgetTimelineChart } from "../../BudgetTimelineChart";
 
 interface EquipmentTabProps {
   rows: EquipmentRow[];
+  timeline?: BudgetTimeline;
 }
 
 function EquipmentChart({ rows }: { rows: EquipmentRow[] }) {
@@ -49,8 +51,15 @@ function EquipmentChart({ rows }: { rows: EquipmentRow[] }) {
   );
 }
 
-export function EquipmentTab({ rows }: EquipmentTabProps) {
-  const [view, setView] = useState<"table" | "chart">("table");
+export function EquipmentTab({ rows, timeline }: EquipmentTabProps) {
+  const [view, setView] = useState<"table" | "chart" | "timeline">("table");
+  const [selectedItem, setSelectedItem] = useState<string>("__all__");
+
+  const itemNames = useMemo(() => {
+    const set = new Set<string>();
+    rows.forEach((r) => set.add(r.equipment_name));
+    return Array.from(set).sort((a, b) => a.localeCompare(b, "ru"));
+  }, [rows]);
 
   if (rows.length === 0) {
     return (
@@ -67,24 +76,57 @@ export function EquipmentTab({ rows }: EquipmentTabProps) {
     <div className="flex flex-col gap-3" data-testid="equipment-tab">
       <div className="flex justify-end">
         <div className="flex gap-1 p-0.5 bg-bg border border-border rounded-pill text-xs">
-          {(["table", "chart"] as const).map((v) => (
+          {(["table", "chart", "timeline"] as const).map((v) => (
             <button
               key={v}
               type="button"
               onClick={() => setView(v)}
-              className={`px-3 py-1 rounded-pill transition-colors ${
+              className={`px-3 py-1 min-h-11 rounded-pill transition-colors ${
                 view === v
                   ? "bg-surface text-ink font-medium shadow-card"
                   : "text-muted hover:text-ink"
               }`}
             >
-              {v === "table" ? "Таблица" : "График"}
+              {v === "table" ? "Таблица" : v === "chart" ? "График" : "Динамика"}
             </button>
           ))}
         </div>
       </div>
 
-      {view === "chart" ? (
+      {view === "timeline" ? (
+        <div className="bg-surface border border-border rounded-card p-4 shadow-card">
+          <div className="flex items-center gap-3 mb-3">
+            <label className="text-xs text-muted">Показать:</label>
+            <select
+              value={selectedItem}
+              onChange={(e) => setSelectedItem(e.target.value)}
+              className="text-sm border border-border bg-bg rounded-card px-2 py-1 text-ink focus:outline-none focus:border-accent"
+            >
+              <option value="__all__">Всю технику</option>
+              {itemNames.map((n) => (
+                <option key={n} value={n} disabled title="Историчность по конкретной позиции появится после расширения снапшотов">
+                  {n} (нет историчности)
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-4 text-xs text-muted mb-3 flex-wrap">
+            <span className="flex items-center gap-1.5">
+              <span style={{ display: "inline-block", width: 24, borderTop: "2px dashed #94a3b8" }} />
+              План
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span style={{ display: "inline-block", width: 24, borderTop: "2px solid #3ba6f1" }} />
+              Факт
+            </span>
+          </div>
+          {timeline ? (
+            <BudgetTimelineChart timeline={timeline} category="equipment" height={260} />
+          ) : (
+            <div className="text-muted text-sm">Нет данных динамики</div>
+          )}
+        </div>
+      ) : view === "chart" ? (
         <EquipmentChart rows={rows} />
       ) : (
         <div className="bg-surface border border-border rounded-card overflow-hidden shadow-card">
