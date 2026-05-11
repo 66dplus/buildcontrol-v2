@@ -107,6 +107,7 @@ from app.routes.projects import router as projects_router  # noqa: E402
 from app.routes.reports import router as reports_router  # noqa: E402
 from app.routes.imports import router as imports_router  # noqa: E402
 from app.routes.agent import router as agent_router  # noqa: E402
+from app.routes.sync import router as sync_router  # noqa: E402
 app.include_router(bitrix_router)
 app.include_router(approval_router)
 app.include_router(telegram_router)
@@ -115,6 +116,7 @@ app.include_router(projects_router)
 app.include_router(reports_router)
 app.include_router(imports_router)
 app.include_router(agent_router)
+app.include_router(sync_router)
 
 
 @app.get("/health")

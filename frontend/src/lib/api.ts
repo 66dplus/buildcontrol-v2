@@ -177,6 +177,16 @@ export interface ApplyAssignmentsResult {
   errors: string[];
 }
 
+export interface SyncFromBitrixResult {
+  projects: number;
+  phases: number;
+  tasks: number;
+  materials: number;
+  labor: number;
+  equipment: number;
+  skipped: string[];
+}
+
 export interface ImportStatus {
   status: "running" | "done" | "error";
   filename: string;
@@ -380,6 +390,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ project_id: projectId, assignments }),
     }),
+  syncFromBitrix: () =>
+    jsonFetch<SyncFromBitrixResult>("/api/sync-from-bitrix", { method: "POST" }),
 };
 
 export { ApiError, jsonFetch };

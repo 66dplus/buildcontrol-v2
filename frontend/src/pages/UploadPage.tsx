@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { api, type AssignmentRow, type Member } from "../lib/api";
+import { api, type Member, type SyncFromBitrixResult } from "../lib/api";
 
 type UploadStep = "idle" | "uploading" | "polling" | "assigning" | "applying" | "done";
 
@@ -28,6 +28,24 @@ export function UploadPage() {
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<SyncFromBitrixResult | null>(null);
+  const [syncError, setSyncError] = useState("");
+
+  async function runSync() {
+    setSyncing(true);
+    setSyncResult(null);
+    setSyncError("");
+    try {
+      const result = await api.syncFromBitrix();
+      setSyncResult(result);
+    } catch (e) {
+      setSyncError((e as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
 
   function handleErr(msg: string) {
     setError(msg);
@@ -357,6 +375,58 @@ export function UploadPage() {
           </button>
         </div>
       )}
+
+      {/* Sync from Bitrix24 card — always visible */}
+      <div className="mt-8 rounded-card border border-border p-5" data-testid="sync-card">
+        <h2 className="font-heading text-base text-ink mb-1">Синхронизация из Bitrix24</h2>
+        <p className="text-xs text-muted mb-4">
+          Подтягивает проекты, созданные напрямую в Bitrix24, в локальную базу данных.
+          Операция безопасна — данные только добавляются/обновляются, ничего не удаляется.
+        </p>
+
+        {syncError && (
+          <div className="mb-3 bg-warning/10 border border-warning text-warning rounded px-3 py-2 text-xs">
+            {syncError}
+          </div>
+        )}
+
+        {syncResult && (
+          <div className="mb-3 bg-surface border border-border rounded px-3 py-2 text-xs text-ink space-y-1" data-testid="sync-result">
+            <p>
+              Проекты: <span className="font-medium">{syncResult.projects}</span> &nbsp;
+              Этапы бюджета: <span className="font-medium">{syncResult.phases}</span> &nbsp;
+              Задачи: <span className="font-medium">{syncResult.tasks}</span>
+            </p>
+            <p>
+              Материалы: <span className="font-medium">{syncResult.materials}</span> &nbsp;
+              Трудозатраты: <span className="font-medium">{syncResult.labor}</span> &nbsp;
+              Техника: <span className="font-medium">{syncResult.equipment}</span>
+            </p>
+            {syncResult.skipped.length > 0 && (
+              <p className="text-muted">
+                Пропущено ({syncResult.skipped.length}): {syncResult.skipped.join(", ")}
+              </p>
+            )}
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={runSync}
+          disabled={syncing}
+          data-testid="sync-btn"
+          className="bg-accent text-white text-sm font-medium rounded-pill px-5 py-2 hover:bg-accent/90 disabled:opacity-50"
+        >
+          {syncing ? (
+            <span className="flex items-center gap-2">
+              <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              Синхронизация…
+            </span>
+          ) : (
+            "Синхронизировать"
+          )}
+        </button>
+      </div>
     </div>
   );
 }
