@@ -106,21 +106,33 @@ const ANOMALY_COLOR: Record<string, string> = {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function AnomalyDot(props: any) {
-  const { cx, cy, payload } = props as { cx?: number; cy?: number; payload?: ChartPoint };
+  const { cx, cy, payload, category } = props as {
+    cx?: number;
+    cy?: number;
+    payload?: ChartPoint;
+    category?: Category;
+  };
   if (cx == null || cy == null) return null;
-  if (!payload?.anomaly) {
+  // Anomaly markers are computed on the project total — they don't describe
+  // per-category variance. Show plain dots on category views.
+  const showAnomaly = category === "total" && !!payload?.anomaly;
+  if (!showAnomaly) {
     return <circle cx={cx} cy={cy} r={2} fill="#3ba6f1" opacity={0.4} />;
   }
-  const color = ANOMALY_COLOR[payload.anomaly] ?? "#3ba6f1";
+  const color = ANOMALY_COLOR[payload!.anomaly as string] ?? "#3ba6f1";
   return (
-    <circle
-      cx={cx}
-      cy={cy}
-      r={5}
-      fill={color}
-      stroke="white"
-      strokeWidth={1.5}
-    />
+    <g>
+      {/* Invisible larger hit target so hover reliably triggers tooltip */}
+      <circle cx={cx} cy={cy} r={10} fill="transparent" />
+      <circle
+        cx={cx}
+        cy={cy}
+        r={5}
+        fill={color}
+        stroke="white"
+        strokeWidth={1.5}
+      />
+    </g>
   );
 }
 
@@ -136,7 +148,9 @@ function CustomTooltip({
   category: Category;
 }) {
   if (!active || !payload?.length) return null;
-  const p = payload[0].payload;
+  // Recharts may hand us the plan-line payload first; prefer the entry that
+  // has an actual value so anomaly dots reliably surface the right tooltip.
+  const p = payload.find((e) => e.payload?.actual != null)?.payload ?? payload[0].payload;
   if (p.actual == null && p.plan == null) return null;
 
   const variance = p.variance_pct;
@@ -286,7 +300,7 @@ export function BudgetTimelineChart({ timeline, category = "total", height = 260
             connectNulls
             isAnimationActive={false}
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            dot={(props: any) => <AnomalyDot {...props} />}
+            dot={(props: any) => <AnomalyDot {...props} category={category} />}
             activeDot={{ r: 4, fill: "#3ba6f1" }}
           />
         </ComposedChart>
