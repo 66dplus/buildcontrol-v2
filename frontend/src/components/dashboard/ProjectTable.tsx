@@ -1,9 +1,9 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { DashboardProject } from "../../lib/api";
-import { formatMoney, formatPercent } from "../../lib/format";
+import { formatMoney, formatPercent, varianceTier, TIER_ROW_BG, TIER_ICON } from "../../lib/format";
 
-type SortKey = "name" | "total_plan" | "total_actual" | "variance_pct";
+type SortKey = "name" | "total_plan" | "total_actual" | "schedule_variance_pct";
 type SortDir = "asc" | "desc";
 
 interface ProjectTableProps {
@@ -34,15 +34,20 @@ function classifyVariance(pct: number): VarianceBadge {
   };
 }
 
-const HEADERS: { key: SortKey; label: string; align: "left" | "right" }[] = [
+const HEADERS: { key: SortKey; label: string; align: "left" | "right"; hint?: string }[] = [
   { key: "name", label: "Проект", align: "left" },
   { key: "total_plan", label: "Бюджет план", align: "right" },
   { key: "total_actual", label: "Бюджет факт", align: "right" },
-  { key: "variance_pct", label: "Отклонение", align: "right" },
+  {
+    key: "schedule_variance_pct",
+    label: "Отклонение",
+    align: "right",
+    hint: "Отклонение от плана к сегодняшней дате",
+  },
 ];
 
 export function ProjectTable({ projects }: ProjectTableProps) {
-  const [sortKey, setSortKey] = useState<SortKey>("variance_pct");
+  const [sortKey, setSortKey] = useState<SortKey>("schedule_variance_pct");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const navigate = useNavigate();
 
@@ -83,10 +88,10 @@ export function ProjectTable({ projects }: ProjectTableProps) {
 
   return (
     <div
-      className="bg-surface border border-border rounded-card overflow-hidden shadow-card"
+      className="bg-surface border border-border rounded-card overflow-x-auto shadow-card"
       data-testid="project-table"
     >
-      <table className="w-full text-sm">
+      <table className="w-full text-sm min-w-[680px]">
         <thead className="bg-bg border-b border-border text-muted text-xs uppercase tracking-wide">
           <tr>
             {HEADERS.map((h) => (
@@ -95,6 +100,7 @@ export function ProjectTable({ projects }: ProjectTableProps) {
                 className={`px-4 py-3 font-medium ${
                   h.align === "right" ? "text-right" : "text-left"
                 }`}
+                title={h.hint}
               >
                 <button
                   type="button"
@@ -115,15 +121,15 @@ export function ProjectTable({ projects }: ProjectTableProps) {
         </thead>
         <tbody>
           {sorted.map((p) => {
-            const badge = classifyVariance(p.variance_pct);
-            const overrun = p.variance_pct > 15;
+            const scheduleVar = p.schedule_variance_pct;
+            const tier = varianceTier(scheduleVar);
+            const icon = TIER_ICON[tier];
+            const badge = classifyVariance(scheduleVar);
             return (
               <tr
                 key={p.id}
                 onClick={() => navigate(`/projects/${p.id}`)}
-                className={`border-b border-border last:border-0 hover:bg-bg cursor-pointer transition-colors ${
-                  overrun ? "border-l-4 border-l-warning" : ""
-                }`}
+                className={`border-b border-border last:border-0 hover:bg-bg cursor-pointer transition-colors ${TIER_ROW_BG[tier]}`}
                 data-testid={`project-row-${p.id}`}
               >
                 <td className="px-4 py-3 text-ink font-medium">{p.name}</td>
@@ -135,11 +141,18 @@ export function ProjectTable({ projects }: ProjectTableProps) {
                 </td>
                 <td
                   className={`px-4 py-3 text-right tabular ${
-                    overrun ? "text-warning font-semibold" : "text-ink"
+                    tier === "high" ? "text-warning font-semibold" : "text-ink"
                   }`}
                 >
-                  {p.variance_pct > 0 ? "+" : ""}
-                  {formatPercent(p.variance_pct, 1)}
+                  <div>
+                    {icon && <span className="mr-1">{icon}</span>}
+                    {scheduleVar > 0 ? "+" : ""}
+                    {formatPercent(scheduleVar, 1)}
+                  </div>
+                  <div className="text-xs text-muted">
+                    {p.schedule_variance_abs > 0 ? "+" : ""}
+                    {formatMoney(p.schedule_variance_abs, { compact: true })}
+                  </div>
                 </td>
                 <td className="px-4 py-3">
                   <span

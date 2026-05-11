@@ -39,6 +39,15 @@ async def api_dashboard_summary() -> JSONResponse:
     """
     async with get_db() as conn:
         projects = await repo.get_projects(conn)
+        today_str = _date.today().isoformat()
+        # Pre-compute the set of project ids that are behind schedule.
+        behind_q = await conn.execute(
+            "SELECT DISTINCT project_id FROM tasks "
+            "WHERE date_end_plan IS NOT NULL AND date_end_plan < ? AND completion_pct < 100",
+            (today_str,),
+        )
+        behind_ids = {int(r[0]) for r in await behind_q.fetchall()}
+        behind_count = len(behind_ids)
         rows: list[dict[str, Any]] = []
         portfolio_plan = 0.0
         portfolio_actual = 0.0
@@ -58,6 +67,23 @@ async def api_dashboard_summary() -> JSONResponse:
                 if total_plan
                 else 0.0
             )
+
+            # Schedule-aware: expected cumulative plan spend as of today.
+            async with conn.execute(
+                "SELECT date_start_plan, budget_plan FROM tasks "
+                "WHERE project_id=? AND date_start_plan IS NOT NULL AND date_start_plan != '' "
+                "AND date_start_plan <= ?",
+                (p["id"], today_str),
+            ) as cur:
+                expected_rows = await cur.fetchall()
+            expected_by_today = sum(float(r[1] or 0) for r in expected_rows)
+            schedule_variance_abs = total_actual - expected_by_today
+            schedule_variance_pct = (
+                (schedule_variance_abs / expected_by_today) * 100.0
+                if expected_by_today > 0
+                else 0.0
+            )
+
             if variance_pct > 15:
                 anomaly_count += 1
             portfolio_plan += total_plan
@@ -75,15 +101,11 @@ async def api_dashboard_summary() -> JSONResponse:
                 "total_actual": total_actual,
                 "variance_pct": variance_pct,
                 "phase_count": len(phases),
+                "is_behind": p["id"] in behind_ids,
+                "expected_by_today": expected_by_today,
+                "schedule_variance_abs": schedule_variance_abs,
+                "schedule_variance_pct": schedule_variance_pct,
             })
-        today_str = _date.today().isoformat()
-        behind_q = await conn.execute(
-            "SELECT COUNT(DISTINCT project_id) FROM tasks "
-            "WHERE date_end_plan IS NOT NULL AND date_end_plan < ? AND completion_pct < 100",
-            (today_str,),
-        )
-        behind_row = await behind_q.fetchone()
-        behind_count = int(behind_row[0]) if behind_row else 0
     return JSONResponse({
         "projects": rows,
         "kpi": {

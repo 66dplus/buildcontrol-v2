@@ -105,6 +105,10 @@ export interface DashboardProject {
   total_actual: number;
   variance_pct: number;
   phase_count: number;
+  is_behind: boolean;
+  expected_by_today: number;
+  schedule_variance_abs: number;
+  schedule_variance_pct: number;
 }
 
 export interface DashboardKpi {

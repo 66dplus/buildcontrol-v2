@@ -28,20 +28,27 @@ interface ChatPanelProps {
   scrollMaxHeight?: string;
   /** Placeholder for the input box. */
   placeholder?: string;
+  /** Optional prefilled message to send automatically on mount. */
+  initialMessage?: string;
+  /** If true and initialMessage is set, the message is dispatched automatically once. */
+  autoSend?: boolean;
 }
 
 export function ChatPanel({
   greeting = "Спросите что-нибудь о ваших проектах.",
   scrollMaxHeight = "",
   placeholder = "Например: какие проекты в перерасходе?",
+  initialMessage,
+  autoSend = false,
 }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState(initialMessage ?? "");
   const [streaming, setStreaming] = useState(false);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const ctrlRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const idRef = useRef(0);
+  const sentInitialRef = useRef(false);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -51,13 +58,21 @@ export function ChatPanel({
 
   useEffect(() => () => ctrlRef.current?.abort(), []);
 
+  useEffect(() => {
+    if (autoSend && initialMessage && !sentInitialRef.current) {
+      sentInitialRef.current = true;
+      send(initialMessage);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function nextId() {
     idRef.current += 1;
     return idRef.current;
   }
 
-  function send() {
-    const text = input.trim();
+  function send(override?: string) {
+    const text = (override ?? input).trim();
     if (!text || streaming) return;
 
     const userMsg: ChatMessage = { id: nextId(), role: "user", text };

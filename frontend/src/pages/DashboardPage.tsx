@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
-import { api, type DashboardSummary, type DashboardProject } from "../lib/api";
+import { useNavigate } from "react-router-dom";
+import { api, type DashboardSummary } from "../lib/api";
 import { formatMoney } from "../lib/format";
 import { KpiTile } from "../components/dashboard/KpiTile";
 import { ProjectTable } from "../components/dashboard/ProjectTable";
@@ -16,51 +16,52 @@ function pluralProjects(n: number): string {
   return "проектов";
 }
 
-function BudgetBar({ label, plan, actual }: { label: string; plan: number; actual: number }) {
-  const pct = plan > 0 ? Math.min((actual / plan) * 100, 150) : 0;
+function PlanVsFactBars({ plan, actual }: { plan: number; actual: number }) {
+  const max = Math.max(plan, actual, 1);
+  const planPct = Math.round((plan / max) * 100);
+  const actualPct = Math.round((actual / max) * 100);
   const overrun = actual > plan;
   return (
-    <div className="mb-4">
-      <div className="flex justify-between text-sm mb-1.5">
-        <span className="text-ink font-medium">{label}</span>
-        <span className={overrun ? "text-warning font-medium" : "text-muted"}>
-          {formatMoney(actual, { compact: true })} / {formatMoney(plan, { compact: true })}
-          {overrun ? " ⚠" : ""}
-        </span>
+    <div
+      className="bg-surface border border-border rounded-card p-5 shadow-card"
+      data-testid="plan-vs-fact-bars"
+    >
+      <div className="flex items-end justify-around gap-6 h-48">
+        <div className="flex flex-col items-center gap-2 w-full max-w-[100px]">
+          <div className="relative w-16 md:w-20 h-40 bg-bg rounded-card overflow-hidden border border-border">
+            <div
+              className="absolute bottom-0 left-0 right-0 bg-slate-300"
+              style={{ height: `${planPct}%` }}
+            />
+          </div>
+          <div className="text-center">
+            <p className="text-xs text-muted">План</p>
+            <p className="text-sm font-medium text-ink">{formatMoney(plan, { compact: true })}</p>
+          </div>
+        </div>
+        <div className="flex flex-col items-center gap-2 w-full max-w-[100px]">
+          <div className="relative w-16 md:w-20 h-40 bg-bg rounded-card overflow-hidden border border-border">
+            <div
+              className={`absolute bottom-0 left-0 right-0 ${overrun ? "bg-warning" : "bg-accent"}`}
+              style={{ height: `${actualPct}%` }}
+            />
+          </div>
+          <div className="text-center">
+            <p className="text-xs text-muted">Факт</p>
+            <p className={`text-sm font-medium ${overrun ? "text-warning" : "text-ink"}`}>
+              {formatMoney(actual, { compact: true })}
+              {overrun ? " ⚠" : ""}
+            </p>
+          </div>
+        </div>
       </div>
-      <div className="h-3 bg-bg rounded-full overflow-hidden border border-border">
-        <div
-          className={`h-full rounded-full ${overrun ? "bg-warning" : "bg-accent"}`}
-          style={{ width: `${Math.min(pct, 100)}%` }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function BudgetComparisonPanel({ projects }: { projects: DashboardProject[] }) {
-  const totalPlan   = projects.reduce((s, p) => s + p.total_plan, 0);
-  const totalActual = projects.reduce((s, p) => s + p.total_actual, 0);
-  const matPlan     = projects.reduce((s, p) => s + p.materials_plan, 0);
-  const matActual   = projects.reduce((s, p) => s + p.materials_actual, 0);
-  const labPlan     = projects.reduce((s, p) => s + p.labor_plan, 0);
-  const labActual   = projects.reduce((s, p) => s + p.labor_actual, 0);
-  const eqPlan      = projects.reduce((s, p) => s + p.equipment_plan, 0);
-  const eqActual    = projects.reduce((s, p) => s + p.equipment_actual, 0);
-
-  return (
-    <div className="bg-surface border border-border rounded-card p-5 shadow-card">
-      <BudgetBar label="Итого" plan={totalPlan} actual={totalActual} />
-      <div className="border-t border-border my-3" />
-      <BudgetBar label="Материалы" plan={matPlan} actual={matActual} />
-      <BudgetBar label="Труд" plan={labPlan} actual={labActual} />
-      <BudgetBar label="Техника" plan={eqPlan} actual={eqActual} />
     </div>
   );
 }
 
 export function DashboardPage() {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const navigate = useNavigate();
 
   useEffect(() => {
     let cancelled = false;
@@ -91,16 +92,25 @@ export function DashboardPage() {
     ? ((kpi.total_actual - kpi.total_plan) / kpi.total_plan) * 100
     : 0;
 
+  const behindProjects = projects.filter((p) => p.is_behind);
+  const behindNames = behindProjects.map((p) => p.name).join(", ");
+  const askAi = () => {
+    const msg = behindProjects.length > 0
+      ? `У нас отстают проекты: ${behindNames}. По каждому: на сколько дней опаздывают, сколько бюджета потрачено и на каком этапе именно отстают сроки.`
+      : "Расскажи общую картину по проектам.";
+    navigate("/ai", { state: { autoMessage: msg } });
+  };
+
   return (
-    <div className="flex flex-col gap-8" data-testid="dashboard">
+    <div className="flex flex-col gap-6 md:gap-8" data-testid="dashboard">
       <div>
-        <h1 className="font-heading text-2xl text-ink">Дашборд</h1>
+        <h1 className="font-heading text-xl md:text-2xl text-ink">Дашборд</h1>
         <p className="text-muted text-sm">
           Портфель: {projects.length} {pluralProjects(projects.length)}
         </p>
       </div>
 
-      {/* Budget section: KPI tiles + comparison bars */}
+      {/* Budget section: KPI tiles + bars + alert side-by-side */}
       <section>
         <h2 className="font-heading text-lg text-ink mb-4">Бюджет: план vs факт</h2>
 
@@ -124,36 +134,38 @@ export function DashboardPage() {
           />
         </div>
 
-        <BudgetComparisonPanel projects={projects} />
-      </section>
+        <div className="grid grid-cols-1 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-4">
+          <PlanVsFactBars plan={kpi.total_plan} actual={kpi.total_actual} />
 
-      {/* Progress section */}
-      <section>
-        <h2 className="font-heading text-lg text-ink mb-4">Прогресс</h2>
-        {kpi.behind_count > 0 ? (
-          <div
-            className="bg-surface border border-warning/40 rounded-card p-5 shadow-card"
-            data-testid="behind-banner"
-          >
-            <p className="text-ink font-medium text-base">
-              {kpi.behind_count} {pluralProjects(kpi.behind_count)} отстают от графика
-            </p>
-            <p className="text-muted text-sm mt-1">
-              Есть задачи с истёкшим плановым сроком и незавершённым прогрессом.
-            </p>
-            <Link to="/ai" className="inline-block mt-3 text-accent text-sm hover:underline">
-              Спросить AI-ассистента →
-            </Link>
-          </div>
-        ) : (
-          <div
-            className="bg-surface border border-border rounded-card p-5 shadow-card text-center"
-            data-testid="on-track-banner"
-          >
-            <p className="text-ink font-medium">Все проекты идут по графику</p>
-            <p className="text-muted text-sm mt-1">Просроченных задач не обнаружено.</p>
-          </div>
-        )}
+          {kpi.behind_count > 0 ? (
+            <div
+              className="bg-surface border border-warning/40 rounded-card p-5 shadow-card flex flex-col justify-center"
+              data-testid="behind-banner"
+            >
+              <p className="text-ink font-medium text-base">
+                {kpi.behind_count} {pluralProjects(kpi.behind_count)} отстают от графика
+              </p>
+              <p className="text-muted text-sm mt-1">
+                Есть задачи с истёкшим плановым сроком и незавершённым прогрессом.
+              </p>
+              <button
+                type="button"
+                onClick={askAi}
+                className="inline-block self-start mt-3 text-accent text-sm hover:underline min-h-11"
+              >
+                Спросить AI-ассистента →
+              </button>
+            </div>
+          ) : (
+            <div
+              className="bg-surface border border-border rounded-card p-5 shadow-card flex flex-col justify-center text-center"
+              data-testid="on-track-banner"
+            >
+              <p className="text-ink font-medium">Все проекты идут по графику</p>
+              <p className="text-muted text-sm mt-1">Просроченных задач не обнаружено.</p>
+            </div>
+          )}
+        </div>
       </section>
 
       {/* Project table */}
