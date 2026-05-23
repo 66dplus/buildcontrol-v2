@@ -148,10 +148,10 @@ async def test_agent_tool_registry_has_read_and_write_tools() -> None:
     import app.agent.tools.add_comment  # noqa: F401
     import app.agent.tools.assign_user  # noqa: F401
     import app.agent.tools.move_task_stage  # noqa: F401
-    from app.agent.tools import TOOL_REGISTRY, is_write_tool
+    from app.agent.tools import _REGISTRY, is_write_tool
 
-    read_tools = {name for name in TOOL_REGISTRY if not is_write_tool(name)}
-    write_tools = {name for name in TOOL_REGISTRY if is_write_tool(name)}
+    read_tools = {name for name in _REGISTRY if not is_write_tool(name)}
+    write_tools = {name for name in _REGISTRY if is_write_tool(name)}
     assert "list_projects" in read_tools
     assert "query_database" in read_tools
     assert "create_task" in write_tools

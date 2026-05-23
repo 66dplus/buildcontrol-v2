@@ -38,10 +38,9 @@ async def test_list_projects_returns_active(db_path):
 
 @pytest.mark.asyncio
 async def test_list_projects_is_not_write():
-    import app.agent.tools.read
-    from app.agent.tools import TOOL_REGISTRY
-    _, _, is_write = TOOL_REGISTRY["list_projects"]
-    assert not is_write
+    import app.agent.tools.read  # noqa: F401
+    from app.agent.tools import is_write_tool
+    assert not is_write_tool("list_projects")
 
 
 @pytest.mark.asyncio
