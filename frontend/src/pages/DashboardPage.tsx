@@ -103,11 +103,21 @@ export function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-6 md:gap-8" data-testid="dashboard">
-      <div>
-        <h1 className="font-heading text-xl md:text-2xl text-ink">Дашборд</h1>
-        <p className="text-muted text-sm">
-          Портфель: {projects.length} {pluralProjects(projects.length)}
-        </p>
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <h1 className="font-heading text-xl md:text-2xl text-ink">Дашборд</h1>
+          <p className="text-muted text-sm">
+            Портфель: {projects.length} {pluralProjects(projects.length)}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => navigate("/projects/new")}
+          className="bg-accent text-white text-sm font-medium rounded-pill px-5 py-2 hover:bg-accent/90"
+          data-testid="create-project-cta"
+        >
+          + Создать проект
+        </button>
       </div>
 
       {/* Budget section: KPI tiles + bars + alert side-by-side */}

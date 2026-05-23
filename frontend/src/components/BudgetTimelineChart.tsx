@@ -208,6 +208,8 @@ interface Props {
   timeline: BudgetTimeline;
   category?: Category;
   height?: number;
+  planScale?: number;
+  actualScale?: number;
 }
 
 const CATEGORY_KEY: Record<Category, keyof ChartPoint> = {
@@ -217,8 +219,24 @@ const CATEGORY_KEY: Record<Category, keyof ChartPoint> = {
   equipment: "equipment",
 };
 
-export function BudgetTimelineChart({ timeline, category = "total", height = 260 }: Props) {
-  const data = buildChartData(timeline);
+export function BudgetTimelineChart({
+  timeline,
+  category = "total",
+  height = 260,
+  planScale = 1,
+  actualScale = 1,
+}: Props) {
+  const rawData = buildChartData(timeline);
+  const data = (planScale === 1 && actualScale === 1)
+    ? rawData
+    : rawData.map((p) => ({
+        ...p,
+        plan: p.plan == null ? null : p.plan * planScale,
+        actual: p.actual == null ? null : p.actual * actualScale,
+        materials: p.materials == null ? null : p.materials * actualScale,
+        labor: p.labor == null ? null : p.labor * actualScale,
+        equipment: p.equipment == null ? null : p.equipment * actualScale,
+      }));
   const todayStr = new Date().toISOString().slice(0, 10);
   const todayLabel = fmtDate(todayStr);
 

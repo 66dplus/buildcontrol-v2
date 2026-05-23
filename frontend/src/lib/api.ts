@@ -392,6 +392,68 @@ export const api = {
     }),
   syncFromBitrix: () =>
     jsonFetch<SyncFromBitrixResult>("/api/sync-from-bitrix", { method: "POST" }),
+  createProject: (body: {
+    name: string;
+    phases?: Array<{
+      name: string;
+      materials_plan?: number;
+      labor_plan?: number;
+      equipment_plan?: number;
+      tasks?: Array<{
+        name: string;
+        date_start_plan?: string;
+        date_end_plan?: string;
+        budget_plan?: number;
+      }>;
+    }>;
+  }) =>
+    jsonFetch<{ project_id: number; name: string }>("/api/projects/create", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  addMaterial: (
+    projectId: number,
+    body: {
+      phase: string;
+      task_name: string;
+      material_name: string;
+      unit?: string;
+      qty_plan?: number;
+      price_plan?: number;
+    },
+  ) =>
+    jsonFetch<{ ok: boolean }>(`/api/projects/${projectId}/materials/add`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  addLabor: (
+    projectId: number,
+    body: {
+      phase: string;
+      task_name: string;
+      specialty: string;
+      rate?: number;
+      hours_plan?: number;
+    },
+  ) =>
+    jsonFetch<{ ok: boolean }>(`/api/projects/${projectId}/labor/add`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  addEquipment: (
+    projectId: number,
+    body: {
+      phase: string;
+      task_name: string;
+      equipment_name: string;
+      price_per_hour?: number;
+      hours_plan?: number;
+    },
+  ) =>
+    jsonFetch<{ ok: boolean }>(`/api/projects/${projectId}/equipment/add`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 };
 
 export { ApiError, jsonFetch };

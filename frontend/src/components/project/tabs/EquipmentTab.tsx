@@ -3,13 +3,17 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip,
   ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import type { BudgetTimeline, EquipmentRow } from "../../../lib/api";
+import { api, type BudgetTimeline, type EquipmentRow, type TaskRow } from "../../../lib/api";
 import { formatMoney, formatPercent, formatHours, variancePct, varianceTier, TIER_ROW_BG, TIER_ICON } from "../../../lib/format";
 import { BudgetTimelineChart } from "../../BudgetTimelineChart";
+import { AddItemModal } from "../../AddItemModal";
 
 interface EquipmentTabProps {
   rows: EquipmentRow[];
   timeline?: BudgetTimeline;
+  projectId: number;
+  tasks: TaskRow[];
+  onAdded: () => void;
 }
 
 function EquipmentChart({ rows }: { rows: EquipmentRow[] }) {
@@ -51,9 +55,10 @@ function EquipmentChart({ rows }: { rows: EquipmentRow[] }) {
   );
 }
 
-export function EquipmentTab({ rows, timeline }: EquipmentTabProps) {
+export function EquipmentTab({ rows, timeline, projectId, tasks, onAdded }: EquipmentTabProps) {
   const [view, setView] = useState<"table" | "chart" | "timeline">("table");
   const [selectedItem, setSelectedItem] = useState<string>("__all__");
+  const [showAdd, setShowAdd] = useState(false);
 
   const itemNames = useMemo(() => {
     const set = new Set<string>();
@@ -61,20 +66,61 @@ export function EquipmentTab({ rows, timeline }: EquipmentTabProps) {
     return Array.from(set).sort((a, b) => a.localeCompare(b, "ru"));
   }, [rows]);
 
+  const phaseOptions = useMemo(() => {
+    const set = new Set<string>();
+    tasks.forEach((t) => set.add(t.phase));
+    rows.forEach((r) => set.add(r.phase));
+    return Array.from(set).filter(Boolean).sort((a, b) => a.localeCompare(b, "ru"));
+  }, [tasks, rows]);
+
+  const taskOptions = useMemo(
+    () => tasks.map((t) => ({ phase: t.phase, task_name: t.task_name })),
+    [tasks],
+  );
+
+  const addButton = (
+    <button
+      type="button"
+      onClick={() => setShowAdd(true)}
+      className="bg-accent text-white text-xs font-medium rounded-pill px-3 py-1.5 hover:bg-accent/90 min-h-[36px]"
+      data-testid="add-equipment-btn"
+    >
+      + Добавить
+    </button>
+  );
+
+  const modal = showAdd && (
+    <AddItemModal
+      kind="equipment"
+      phaseOptions={phaseOptions}
+      taskOptions={taskOptions}
+      onClose={() => setShowAdd(false)}
+      onSubmit={async (payload) => {
+        await api.addEquipment(projectId, payload as Parameters<typeof api.addEquipment>[1]);
+        onAdded();
+      }}
+    />
+  );
+
   if (rows.length === 0) {
     return (
-      <div
-        className="bg-surface border border-border rounded-card p-8 text-muted text-sm text-center"
-        data-testid="equipment-empty"
-      >
-        Нет данных по технике
+      <div className="flex flex-col gap-3" data-testid="equipment-tab">
+        <div className="flex justify-end">{addButton}</div>
+        <div
+          className="bg-surface border border-border rounded-card p-8 text-muted text-sm text-center"
+          data-testid="equipment-empty"
+        >
+          Нет данных по технике
+        </div>
+        {modal}
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-3" data-testid="equipment-tab">
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        {addButton}
         <div className="flex gap-1 p-0.5 bg-bg border border-border rounded-pill text-xs">
           {(["table", "chart", "timeline"] as const).map((v) => (
             <button
@@ -94,38 +140,58 @@ export function EquipmentTab({ rows, timeline }: EquipmentTabProps) {
       </div>
 
       {view === "timeline" ? (
-        <div className="bg-surface border border-border rounded-card p-4 shadow-card">
-          <div className="flex items-center gap-3 mb-3">
-            <label className="text-xs text-muted">Показать:</label>
-            <select
-              value={selectedItem}
-              onChange={(e) => setSelectedItem(e.target.value)}
-              className="text-sm border border-border bg-bg rounded-card px-2 py-1 text-ink focus:outline-none focus:border-accent"
-            >
-              <option value="__all__">Всю технику</option>
-              {itemNames.map((n) => (
-                <option key={n} value={n} disabled title="Историчность по конкретной позиции появится после расширения снапшотов">
-                  {n} (нет историчности)
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-center gap-4 text-xs text-muted mb-3 flex-wrap">
-            <span className="flex items-center gap-1.5">
-              <span style={{ display: "inline-block", width: 24, borderTop: "2px dashed #94a3b8" }} />
-              План
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span style={{ display: "inline-block", width: 24, borderTop: "2px solid #3ba6f1" }} />
-              Факт
-            </span>
-          </div>
-          {timeline ? (
-            <BudgetTimelineChart timeline={timeline} category="equipment" height={260} />
-          ) : (
-            <div className="text-muted text-sm">Нет данных динамики</div>
-          )}
-        </div>
+        (() => {
+          const sumPlan = rows.reduce((s, r) => s + r.total_plan, 0);
+          const sumActual = rows.reduce((s, r) => s + r.total_actual, 0);
+          const selected = selectedItem === "__all__"
+            ? null
+            : rows.find((r) => r.equipment_name === selectedItem);
+          const planScale = selected && sumPlan > 0 ? selected.total_plan / sumPlan : 1;
+          const actualScale = selected && sumActual > 0 ? selected.total_actual / sumActual : 1;
+          return (
+            <div className="bg-surface border border-border rounded-card p-4 shadow-card">
+              <div className="flex items-center gap-3 mb-3">
+                <label className="text-xs text-muted">Показать:</label>
+                <select
+                  value={selectedItem}
+                  onChange={(e) => setSelectedItem(e.target.value)}
+                  className="text-sm border border-border bg-bg rounded-card px-2 py-1 text-ink focus:outline-none focus:border-accent"
+                >
+                  <option value="__all__">Всю технику</option>
+                  {itemNames.map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-4 text-xs text-muted mb-3 flex-wrap">
+                <span className="flex items-center gap-1.5">
+                  <span style={{ display: "inline-block", width: 24, borderTop: "2px dashed #94a3b8" }} />
+                  План
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span style={{ display: "inline-block", width: 24, borderTop: "2px solid #3ba6f1" }} />
+                  Факт
+                </span>
+                {selected && (
+                  <span className="text-muted/70">
+                    Доля позиции в категории — пропорциональная оценка кривой
+                  </span>
+                )}
+              </div>
+              {timeline ? (
+                <BudgetTimelineChart
+                  timeline={timeline}
+                  category="equipment"
+                  height={260}
+                  planScale={planScale}
+                  actualScale={actualScale}
+                />
+              ) : (
+                <div className="text-muted text-sm">Нет данных динамики</div>
+              )}
+            </div>
+          );
+        })()
       ) : view === "chart" ? (
         <EquipmentChart rows={rows} />
       ) : (
@@ -191,6 +257,7 @@ export function EquipmentTab({ rows, timeline }: EquipmentTabProps) {
           </table>
         </div>
       )}
+      {modal}
     </div>
   );
 }

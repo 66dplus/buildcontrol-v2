@@ -3,7 +3,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from bitrix.client import BitrixClient
@@ -535,3 +535,166 @@ async def api_equipment_all(
     async with get_db() as conn:
         rows = await repo.get_equipment(conn, project_id, phase=phase, task_name=task)
     return JSONResponse(content=rows)
+
+
+# ---------------------------------------------------------------------------
+# Demo-mode write endpoints (SQLite-only, no Bitrix round-trip)
+# Used by the in-UI "Create Project" wizard and "+ Добавить" modals on
+# Materials/Labor/Equipment tabs. Keeps the demo flow self-contained.
+# ---------------------------------------------------------------------------
+
+def _f(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+async def _next_local_project_id(conn) -> int:
+    """Pick a free project_id in the demo range (>= 900000)."""
+    async with conn.execute(
+        "SELECT COALESCE(MAX(id), 899999) + 1 AS next_id FROM projects WHERE id >= 900000"
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row["next_id"]) if row else 900000
+
+
+@router.post("/api/projects/create")
+async def api_create_project(request: Request) -> JSONResponse:
+    """
+    Create a project from the UI wizard (SQLite-only, no Bitrix sync).
+    Body: { name, phases?: [{ name, materials_plan?, labor_plan?, equipment_plan?,
+                              tasks?: [{ name, date_start_plan?, date_end_plan?,
+                                         budget_plan? }] }] }
+    """
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Project name is required")
+
+    phases = body.get("phases") or []
+
+    async with get_db() as conn:
+        project_id = await _next_local_project_id(conn)
+        await repo.upsert_project(conn, project_id, name)
+
+        for phase in phases:
+            phase_name = (phase.get("name") or "").strip()
+            if not phase_name:
+                continue
+            materials_plan = _f(phase.get("materials_plan"))
+            labor_plan = _f(phase.get("labor_plan"))
+            equipment_plan = _f(phase.get("equipment_plan"))
+            total_plan = materials_plan + labor_plan + equipment_plan
+            await repo.upsert_budget_phase(
+                conn,
+                project_id,
+                phase_name,
+                materials_plan=materials_plan,
+                labor_plan=labor_plan,
+                equipment_plan=equipment_plan,
+                total_plan=total_plan,
+            )
+            for task in phase.get("tasks") or []:
+                task_name = (task.get("name") or "").strip()
+                if not task_name:
+                    continue
+                await repo.upsert_task(
+                    conn,
+                    project_id,
+                    phase_name,
+                    task_name,
+                    date_start_plan=task.get("date_start_plan"),
+                    date_end_plan=task.get("date_end_plan"),
+                    budget_plan=_f(task.get("budget_plan")),
+                )
+
+    logger.info(f"Demo project created via UI: id={project_id} name={name!r}")
+    return JSONResponse(content={"project_id": project_id, "name": name})
+
+
+@router.post("/api/projects/{project_id}/materials/add")
+async def api_add_material(project_id: int, request: Request) -> JSONResponse:
+    """Add a material row to a project. Body: { phase, task_name, material_name,
+    unit?, price_plan?, qty_plan? }."""
+    body = await request.json()
+    phase = (body.get("phase") or "").strip()
+    task_name = (body.get("task_name") or "").strip()
+    material_name = (body.get("material_name") or "").strip()
+    if not (phase and task_name and material_name):
+        raise HTTPException(
+            status_code=400,
+            detail="phase, task_name and material_name are required",
+        )
+    qty_plan = _f(body.get("qty_plan"))
+    price_plan = _f(body.get("price_plan"))
+    async with get_db() as conn:
+        await repo.upsert_material(
+            conn,
+            project_id,
+            phase,
+            task_name,
+            material_name,
+            unit=(body.get("unit") or "").strip(),
+            qty_plan=qty_plan,
+            price_plan=price_plan,
+            cost_plan=qty_plan * price_plan,
+        )
+    return JSONResponse(content={"ok": True})
+
+
+@router.post("/api/projects/{project_id}/labor/add")
+async def api_add_labor(project_id: int, request: Request) -> JSONResponse:
+    """Add a labor row. Body: { phase, task_name, specialty, rate?, hours_plan? }."""
+    body = await request.json()
+    phase = (body.get("phase") or "").strip()
+    task_name = (body.get("task_name") or "").strip()
+    specialty = (body.get("specialty") or "").strip()
+    if not (phase and task_name and specialty):
+        raise HTTPException(
+            status_code=400,
+            detail="phase, task_name and specialty are required",
+        )
+    rate = _f(body.get("rate"))
+    hours_plan = _f(body.get("hours_plan"))
+    async with get_db() as conn:
+        await repo.upsert_labor(
+            conn,
+            project_id,
+            phase,
+            task_name,
+            specialty,
+            rate=rate,
+            hours_plan=hours_plan,
+            payroll_plan=rate * hours_plan,
+        )
+    return JSONResponse(content={"ok": True})
+
+
+@router.post("/api/projects/{project_id}/equipment/add")
+async def api_add_equipment(project_id: int, request: Request) -> JSONResponse:
+    """Add equipment row. Body: { phase, task_name, equipment_name, price_per_hour?,
+    hours_plan? }."""
+    body = await request.json()
+    phase = (body.get("phase") or "").strip()
+    task_name = (body.get("task_name") or "").strip()
+    equipment_name = (body.get("equipment_name") or "").strip()
+    if not (phase and task_name and equipment_name):
+        raise HTTPException(
+            status_code=400,
+            detail="phase, task_name and equipment_name are required",
+        )
+    price = _f(body.get("price_per_hour"))
+    hours_plan = _f(body.get("hours_plan"))
+    async with get_db() as conn:
+        await repo.upsert_equipment(
+            conn,
+            project_id,
+            phase,
+            task_name,
+            equipment_name,
+            price_per_hour=price,
+            hours_plan=hours_plan,
+            total_plan=price * hours_plan,
+        )
+    return JSONResponse(content={"ok": True})

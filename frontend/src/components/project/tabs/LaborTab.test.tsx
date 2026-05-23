@@ -21,12 +21,19 @@ function row(overrides: Partial<LaborRow> = {}): LaborRow {
 
 describe("LaborTab", () => {
   it("renders empty state when no rows", () => {
-    render(<LaborTab rows={[]} />);
+    render(<LaborTab rows={[]} projectId={7} tasks={[]} onAdded={() => {}} />);
     expect(screen.getByTestId("labor-empty")).toBeInTheDocument();
   });
 
   it("renders one row per labor entry", () => {
-    render(<LaborTab rows={[row({ id: 1 }), row({ id: 2, specialty: "Бетонщик" })]} />);
+    render(
+      <LaborTab
+        rows={[row({ id: 1 }), row({ id: 2, specialty: "Бетонщик" })]}
+        projectId={7}
+        tasks={[]}
+        onAdded={() => {}}
+      />,
+    );
     expect(screen.getByTestId("labor-row-1")).toBeInTheDocument();
     expect(screen.getByTestId("labor-row-2")).toBeInTheDocument();
     expect(screen.getByText("Арматурщик")).toBeInTheDocument();
@@ -40,6 +47,9 @@ describe("LaborTab", () => {
           row({ id: 1, payroll_plan: 100, payroll_actual: 110 }),
           row({ id: 2, payroll_plan: 100, payroll_actual: 200 }),
         ]}
+        projectId={7}
+        tasks={[]}
+        onAdded={() => {}}
       />,
     );
     expect(screen.getByTestId("labor-row-1").className).not.toContain("bg-warning");

@@ -21,13 +21,18 @@ function row(overrides: Partial<EquipmentRow> = {}): EquipmentRow {
 
 describe("EquipmentTab", () => {
   it("renders empty state when no rows", () => {
-    render(<EquipmentTab rows={[]} />);
+    render(<EquipmentTab rows={[]} projectId={7} tasks={[]} onAdded={() => {}} />);
     expect(screen.getByTestId("equipment-empty")).toBeInTheDocument();
   });
 
   it("renders one row per equipment item", () => {
     render(
-      <EquipmentTab rows={[row({ id: 1 }), row({ id: 2, equipment_name: "Кран" })]} />,
+      <EquipmentTab
+        rows={[row({ id: 1 }), row({ id: 2, equipment_name: "Кран" })]}
+        projectId={7}
+        tasks={[]}
+        onAdded={() => {}}
+      />,
     );
     expect(screen.getByTestId("equipment-row-1")).toBeInTheDocument();
     expect(screen.getByTestId("equipment-row-2")).toBeInTheDocument();
@@ -41,6 +46,9 @@ describe("EquipmentTab", () => {
           row({ id: 1, total_plan: 100, total_actual: 105 }),
           row({ id: 2, total_plan: 100, total_actual: 200 }),
         ]}
+        projectId={7}
+        tasks={[]}
+        onAdded={() => {}}
       />,
     );
     expect(screen.getByTestId("equipment-row-1").className).not.toContain("bg-warning");

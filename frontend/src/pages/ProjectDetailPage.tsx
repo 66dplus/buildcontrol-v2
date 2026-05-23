@@ -38,6 +38,8 @@ export function ProjectDetailPage() {
   const projectId = Number(id);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [tab, setTab] = useState<TabKey>("overview");
+  const [reloadKey, setReloadKey] = useState(0);
+  const refresh = () => setReloadKey((k) => k + 1);
 
   useEffect(() => {
     if (!Number.isFinite(projectId)) {
@@ -45,7 +47,7 @@ export function ProjectDetailPage() {
       return;
     }
     let cancelled = false;
-    setState({ kind: "loading" });
+    if (reloadKey === 0) setState({ kind: "loading" });
     Promise.all([
       api.projects(),
       api.phases(projectId),
@@ -77,7 +79,7 @@ export function ProjectDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+  }, [projectId, reloadKey]);
 
   if (state.kind === "loading") {
     return (
@@ -122,9 +124,33 @@ export function ProjectDetailPage() {
       <div data-testid={`tab-content-${tab}`}>
         {tab === "overview" && <OverviewTab phases={data.phases} timeline={data.timeline} />}
         {tab === "stages" && <StagesTab tasks={data.tasks} />}
-        {tab === "materials" && <MaterialsTab materials={data.materials} timeline={data.timeline} />}
-        {tab === "labor" && <LaborTab rows={data.labor} timeline={data.timeline} />}
-        {tab === "equipment" && <EquipmentTab rows={data.equipment} timeline={data.timeline} />}
+        {tab === "materials" && (
+          <MaterialsTab
+            materials={data.materials}
+            timeline={data.timeline}
+            projectId={projectId}
+            tasks={data.tasks}
+            onAdded={refresh}
+          />
+        )}
+        {tab === "labor" && (
+          <LaborTab
+            rows={data.labor}
+            timeline={data.timeline}
+            projectId={projectId}
+            tasks={data.tasks}
+            onAdded={refresh}
+          />
+        )}
+        {tab === "equipment" && (
+          <EquipmentTab
+            rows={data.equipment}
+            timeline={data.timeline}
+            projectId={projectId}
+            tasks={data.tasks}
+            onAdded={refresh}
+          />
+        )}
       </div>
     </div>
   );

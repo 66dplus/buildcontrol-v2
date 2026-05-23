@@ -29,7 +29,12 @@ function material(overrides: Partial<MaterialRow> = {}): MaterialRow {
 function renderTab(materials: MaterialRow[]) {
   return render(
     <SidePanelProvider>
-      <MaterialsTab materials={materials} />
+      <MaterialsTab
+        materials={materials}
+        projectId={7}
+        tasks={[]}
+        onAdded={() => {}}
+      />
       <SidePanel />
     </SidePanelProvider>,
   );

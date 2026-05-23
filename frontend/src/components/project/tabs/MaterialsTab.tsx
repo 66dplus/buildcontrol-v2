@@ -3,15 +3,19 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip,
   ResponsiveContainer, Legend, CartesianGrid,
 } from "recharts";
-import type { BudgetTimeline, MaterialRow } from "../../../lib/api";
+import { api, type BudgetTimeline, type MaterialRow, type TaskRow } from "../../../lib/api";
 import { formatQty, varianceTier, TIER_ROW_BG, TIER_ICON } from "../../../lib/format";
 import { useSidePanel } from "../../../contexts/SidePanelContext";
 import { MaterialDetailPanel } from "../panels/MaterialDetailPanel";
 import { BudgetTimelineChart } from "../../BudgetTimelineChart";
+import { AddItemModal } from "../../AddItemModal";
 
 interface MaterialsTabProps {
   materials: MaterialRow[];
   timeline?: BudgetTimeline;
+  projectId: number;
+  tasks: TaskRow[];
+  onAdded: () => void;
 }
 
 function fmtCompact(n: number): string {
@@ -57,10 +61,11 @@ function MaterialsChart({ materials }: { materials: MaterialRow[] }) {
   );
 }
 
-export function MaterialsTab({ materials, timeline }: MaterialsTabProps) {
+export function MaterialsTab({ materials, timeline, projectId, tasks, onAdded }: MaterialsTabProps) {
   const { openPanel } = useSidePanel();
   const [view, setView] = useState<"table" | "chart" | "timeline">("table");
   const [selectedItem, setSelectedItem] = useState<string>("__all__");
+  const [showAdd, setShowAdd] = useState(false);
 
   const itemNames = useMemo(() => {
     const set = new Set<string>();
@@ -68,20 +73,61 @@ export function MaterialsTab({ materials, timeline }: MaterialsTabProps) {
     return Array.from(set).sort((a, b) => a.localeCompare(b, "ru"));
   }, [materials]);
 
+  const phaseOptions = useMemo(() => {
+    const set = new Set<string>();
+    tasks.forEach((t) => set.add(t.phase));
+    materials.forEach((m) => set.add(m.phase));
+    return Array.from(set).filter(Boolean).sort((a, b) => a.localeCompare(b, "ru"));
+  }, [tasks, materials]);
+
+  const taskOptions = useMemo(
+    () => tasks.map((t) => ({ phase: t.phase, task_name: t.task_name })),
+    [tasks],
+  );
+
+  const addButton = (
+    <button
+      type="button"
+      onClick={() => setShowAdd(true)}
+      className="bg-accent text-white text-xs font-medium rounded-pill px-3 py-1.5 hover:bg-accent/90 min-h-[36px]"
+      data-testid="add-material-btn"
+    >
+      + Добавить
+    </button>
+  );
+
+  const modal = showAdd && (
+    <AddItemModal
+      kind="material"
+      phaseOptions={phaseOptions}
+      taskOptions={taskOptions}
+      onClose={() => setShowAdd(false)}
+      onSubmit={async (payload) => {
+        await api.addMaterial(projectId, payload as Parameters<typeof api.addMaterial>[1]);
+        onAdded();
+      }}
+    />
+  );
+
   if (materials.length === 0) {
     return (
-      <div
-        className="bg-surface border border-border rounded-card p-8 text-muted text-sm text-center"
-        data-testid="materials-empty"
-      >
-        Нет материалов в этом проекте
+      <div className="flex flex-col gap-3" data-testid="materials-tab">
+        <div className="flex justify-end">{addButton}</div>
+        <div
+          className="bg-surface border border-border rounded-card p-8 text-muted text-sm text-center"
+          data-testid="materials-empty"
+        >
+          Нет материалов в этом проекте
+        </div>
+        {modal}
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-3" data-testid="materials-tab">
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        {addButton}
         <div className="flex gap-1 p-0.5 bg-bg border border-border rounded-pill text-xs">
           {(["table", "chart", "timeline"] as const).map((v) => (
             <button
@@ -101,38 +147,58 @@ export function MaterialsTab({ materials, timeline }: MaterialsTabProps) {
       </div>
 
       {view === "timeline" ? (
-        <div className="bg-surface border border-border rounded-card p-4 shadow-card">
-          <div className="flex items-center gap-3 mb-3">
-            <label className="text-xs text-muted">Показать:</label>
-            <select
-              value={selectedItem}
-              onChange={(e) => setSelectedItem(e.target.value)}
-              className="text-sm border border-border bg-bg rounded-card px-2 py-1 text-ink focus:outline-none focus:border-accent"
-            >
-              <option value="__all__">Все материалы</option>
-              {itemNames.map((n) => (
-                <option key={n} value={n} disabled title="Историчность по конкретной позиции появится после расширения снапшотов">
-                  {n} (нет историчности)
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-center gap-4 text-xs text-muted mb-3 flex-wrap">
-            <span className="flex items-center gap-1.5">
-              <span style={{ display: "inline-block", width: 24, borderTop: "2px dashed #94a3b8" }} />
-              План
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span style={{ display: "inline-block", width: 24, borderTop: "2px solid #3ba6f1" }} />
-              Факт
-            </span>
-          </div>
-          {timeline ? (
-            <BudgetTimelineChart timeline={timeline} category="materials" height={260} />
-          ) : (
-            <div className="text-muted text-sm">Нет данных динамики</div>
-          )}
-        </div>
+        (() => {
+          const sumPlan = materials.reduce((s, r) => s + r.cost_plan, 0);
+          const sumActual = materials.reduce((s, r) => s + r.cost_actual, 0);
+          const selected = selectedItem === "__all__"
+            ? null
+            : materials.find((r) => r.material_name === selectedItem);
+          const planScale = selected && sumPlan > 0 ? selected.cost_plan / sumPlan : 1;
+          const actualScale = selected && sumActual > 0 ? selected.cost_actual / sumActual : 1;
+          return (
+            <div className="bg-surface border border-border rounded-card p-4 shadow-card">
+              <div className="flex items-center gap-3 mb-3">
+                <label className="text-xs text-muted">Показать:</label>
+                <select
+                  value={selectedItem}
+                  onChange={(e) => setSelectedItem(e.target.value)}
+                  className="text-sm border border-border bg-bg rounded-card px-2 py-1 text-ink focus:outline-none focus:border-accent"
+                >
+                  <option value="__all__">Все материалы</option>
+                  {itemNames.map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-4 text-xs text-muted mb-3 flex-wrap">
+                <span className="flex items-center gap-1.5">
+                  <span style={{ display: "inline-block", width: 24, borderTop: "2px dashed #94a3b8" }} />
+                  План
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span style={{ display: "inline-block", width: 24, borderTop: "2px solid #3ba6f1" }} />
+                  Факт
+                </span>
+                {selected && (
+                  <span className="text-muted/70">
+                    Доля позиции в категории — пропорциональная оценка кривой
+                  </span>
+                )}
+              </div>
+              {timeline ? (
+                <BudgetTimelineChart
+                  timeline={timeline}
+                  category="materials"
+                  height={260}
+                  planScale={planScale}
+                  actualScale={actualScale}
+                />
+              ) : (
+                <div className="text-muted text-sm">Нет данных динамики</div>
+              )}
+            </div>
+          );
+        })()
       ) : view === "chart" ? (
         <MaterialsChart materials={materials} />
       ) : (
@@ -190,6 +256,7 @@ export function MaterialsTab({ materials, timeline }: MaterialsTabProps) {
           </table>
         </div>
       )}
+      {modal}
     </div>
   );
 }

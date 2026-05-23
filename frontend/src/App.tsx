@@ -4,6 +4,7 @@ import { SidePanelProvider } from "./contexts/SidePanelContext";
 import { AppShell } from "./components/AppShell";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ProjectDetailPage } from "./pages/ProjectDetailPage";
+import { CreateProjectPage } from "./pages/CreateProjectPage";
 import { AiPage } from "./pages/AiPage";
 import { ForemanPage } from "./pages/ForemanPage";
 import { ProcurementPage } from "./pages/ProcurementPage";
@@ -17,6 +18,7 @@ export default function App() {
           <AppShell>
             <Routes>
               <Route path="/" element={<DashboardPage />} />
+              <Route path="/projects/new" element={<CreateProjectPage />} />
               <Route path="/projects/:id" element={<ProjectDetailPage />} />
               <Route path="/ai" element={<AiPage />} />
               <Route path="/foreman-report" element={<ForemanPage />} />
