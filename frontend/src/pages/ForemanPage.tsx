@@ -4,6 +4,7 @@ import {
   type ForemanEquipment,
   type ForemanLabor,
   type ForemanMaterial,
+  type ForemanSubtask,
   type ForemanTask,
   type Project,
 } from "../lib/api";
@@ -94,6 +95,7 @@ export function ForemanPage() {
   const [materials, setMaterials] = useState<ForemanMaterial[]>([]);
   const [labor, setLabor] = useState<ForemanLabor[]>([]);
   const [equipment, setEquipment] = useState<ForemanEquipment[]>([]);
+  const [subtasks, setSubtasks] = useState<ForemanSubtask[]>([]);
   const [matVals, setMatVals] = useState<Record<string, number>>({});
   const [labVals, setLabVals] = useState<Record<string, number>>({});
   const [eqVals, setEqVals] = useState<Record<string, number>>({});
@@ -126,6 +128,7 @@ export function ForemanPage() {
       setMaterials([]);
       setLabor([]);
       setEquipment([]);
+      setSubtasks([]);
       setMatVals({});
       setLabVals({});
       setEqVals({});
@@ -136,11 +139,13 @@ export function ForemanPage() {
       api.foremanMaterials(selectedProjectId, selectedPhase, selectedTask),
       api.foremanLabor(selectedProjectId, selectedPhase, selectedTask),
       api.foremanEquipment(selectedProjectId, selectedPhase, selectedTask).catch(() => []),
+      api.foremanSubtasks(selectedProjectId, selectedPhase, selectedTask).catch(() => []),
     ])
-      .then(([m, l, e]) => {
+      .then(([m, l, e, s]) => {
         setMaterials(m);
         setLabor(l);
         setEquipment(e);
+        setSubtasks(s);
         setMatVals({});
         setLabVals({});
         setEqVals({});
@@ -294,6 +299,54 @@ export function ForemanPage() {
 
         {selectedTask && !loadingRows && (
           <div className="space-y-4 border border-border rounded-card p-4 bg-surface">
+            <section data-testid="foreman-subtasks">
+              <h3 className="text-xs font-medium text-muted uppercase tracking-wide mb-2">
+                Подзадачи
+              </h3>
+              {subtasks.length === 0 ? (
+                <p className="text-xs text-muted">
+                  Нет подзадач для этой задачи
+                </p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {subtasks.map((s) => {
+                    const done = !!s.date_fact_done;
+                    const inProgress = !!s.date_fact_start && !done;
+                    return (
+                      <li
+                        key={s.element_id}
+                        className="flex items-center gap-2 text-sm"
+                      >
+                        <span
+                          className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${
+                            done
+                              ? "bg-emerald-500"
+                              : inProgress
+                              ? "bg-amber-500"
+                              : "bg-slate-300"
+                          }`}
+                          title={s.status}
+                        />
+                        <span
+                          className={`flex-1 truncate ${
+                            done ? "text-muted line-through" : "text-ink"
+                          }`}
+                          title={s.title}
+                        >
+                          {s.title}
+                        </span>
+                        {s.deadline_plan && (
+                          <span className="text-xs text-muted flex-shrink-0">
+                            до {s.deadline_plan.slice(0, 10)}
+                          </span>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </section>
+
             <section>
               <h3 className="text-xs font-medium text-muted uppercase tracking-wide mb-2">
                 Материалы — расход

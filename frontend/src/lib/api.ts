@@ -149,6 +149,18 @@ export interface ForemanEquipment {
   name: string;
 }
 
+export interface ForemanSubtask {
+  element_id: number;
+  title: string;
+  order: number;
+  deadline_plan: string | null;
+  date_start_plan: string | null;
+  status: string;
+  date_fact_start: string | null;
+  date_fact_done: string | null;
+  bitrix_subtask_id: number | null;
+}
+
 export interface Stage {
   id: number;
   title: string;
@@ -348,6 +360,10 @@ export const api = {
   foremanEquipment: (projectId: number, etap: string, zadacha: string) =>
     jsonFetch<ForemanEquipment[]>(
       `/api/projects/${projectId}/equipment${qs({ etap, zadacha })}`,
+    ),
+  foremanSubtasks: (projectId: number, etap: string, zadacha: string) =>
+    jsonFetch<ForemanSubtask[]>(
+      `/api/projects/${projectId}/subtasks${qs({ etap, zadacha })}`,
     ),
   stages: (projectId: number) =>
     jsonFetch<Stage[]>(`/api/projects/${projectId}/stages`),
