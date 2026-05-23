@@ -1,7 +1,7 @@
 # BuildControl — Production Info
 
 > **Audience:** Anyone deploying, maintaining, or debugging this app on the VPS.  
-> **Last updated:** 2026-04-26
+> **Last updated:** 2026-05-23
 
 ---
 
@@ -180,7 +180,7 @@ The app uses SQLite as its primary read database. Bitrix24 lists are kept as a d
 
 | Path | `/opt/buildcontrol/buildcontrol.db` |
 |---|---|
-| Tables | `projects`, `tasks`, `materials`, `labor`, `equipment_items`, `budget_phases`, `purchase_requests` |
+| Tables | `projects`, `tasks`, `materials`, `labor`, `equipment_items`, `budget_phases`, `budget_snapshots`, `purchase_requests`, `idempotency_cache`, `audit_log` |
 | Populated by | `scripts/import_excel.py` (dual-write on import) + report/purchase webhooks |
 
 ### Inspect the database
@@ -206,7 +206,7 @@ After deploying code to a server that has existing Bitrix data but an empty SQLi
 
 ```bash
 cd /opt/buildcontrol
-venv/bin/python3 scripts/migrate_bitrix_to_sqlite.py
+venv/bin/python3 scripts/sync_from_bitrix.py
 ```
 
 This reads all projects and their 5 Universal Lists from Bitrix and inserts them into SQLite. Safe to re-run — uses `INSERT OR REPLACE` (idempotent). Takes ~30s per project due to Bitrix rate limiting.
@@ -217,8 +217,7 @@ Run the benchmark to verify the agent generates correct SQL. Use `--extended` to
 
 ```bash
 cd /opt/buildcontrol
-venv/bin/python3 scripts/test_agent_qa.py             # 15 base
-venv/bin/python3 scripts/test_agent_qa.py --extended  # 24 total + sanity checks
+venv/bin/python3 scripts/test_agent_live.py
 ```
 
 Each run writes a transcript to `/tmp/agent_qa_<ts>.log`.
@@ -375,7 +374,7 @@ curl http://localhost:8000/health
 
 ## UI / Visual Design
 
-All HTML surfaces (widget tabs, approval page, install/rebind) share a single Procore-inspired stylesheet defined in `app/_ui_styles.py` (`BASE_CSS` + `FONT_LINKS`). Spec lives in `.stitch/DESIGN.md`.
+All HTML surfaces (widget tabs, approval page, install/rebind) share a single Procore-inspired stylesheet defined in `app/_ui_styles.py` (`BASE_CSS` + `FONT_LINKS`).
 
 - **No new runtime deps.** Styles are still inlined into the HTML response — same deploy story (rsync + `systemctl restart buildcontrol`).
 - **Outbound network:** the `<head>` includes a Google Fonts `<link>` for IBM Plex Sans / Mono. If the VPS or the user's browser cannot reach `fonts.googleapis.com`, the CSS falls back to the system font stack (`-apple-system, Segoe UI, Roboto, ...`) — visuals degrade gracefully.
@@ -489,7 +488,7 @@ For projects imported before that date (which have Bitrix child tasks for subtas
 | Import returns 400 immediately on upload | The pre-validation guard rejected the file as not a valid xlsx; re-export from Excel and retry |
 | Port 8000 not listening | `ss -tlnp \| grep 8000` — if empty, app is down |
 | Director Telegram bot silent | (1) `curl https://api.telegram.org/bot<TOKEN>/getWebhookInfo` — check `last_error_message`. (2) `journalctl -u buildcontrol --since '10 min ago'` — common causes: `ModuleNotFoundError: No module named 'openai'` (run `/opt/buildcontrol/venv/bin/pip install -r /opt/buildcontrol/requirements.txt`); chat_id not in `TELEGRAM_DIRECTOR_CHAT_IDS`; `OPENROUTER_API_KEY` missing |
-| Agent answers wrong numbers / "нет данных" unexpectedly | SQLite may be empty or stale — run `scripts/migrate_bitrix_to_sqlite.py`. Also check `py_lower()` is registered: if you see `no such function: py_lower` in logs, the connection was opened without `db.database.get_db()` (e.g. direct aiosqlite call) |
+| Agent answers wrong numbers / "нет данных" unexpectedly | SQLite may be empty or stale — run `scripts/sync_from_bitrix.py`. Also check `py_lower()` is registered: if you see `no such function: py_lower` in logs, the connection was opened without `db.database.get_db()` (e.g. direct aiosqlite call) |
 | Agent shows `qty_consumed` instead of `qty_bought` for "что куплено" questions | Schema docs (`db/schema_docs.py`) didn't emphasize the distinction — verify the ВАЖНО block is present and re-deploy |
 | Cyrillic LIKE returns empty results | SQLite built-in `LOWER()` does NOT handle Cyrillic. Always use `py_lower()` (registered as a custom function). The schema_docs examples all use `py_lower()` — if the agent generates bare `LOWER()` or bare `LIKE` it won't match Russian text |
 | Approve/reject Telegram message buttons stay forever | Bot couldn't `editMessageText` — check `journalctl` for `Telegram editMessageText failed`. Most often the bot lacks edit permission in a group chat; promote it to admin or DM the bot directly |
