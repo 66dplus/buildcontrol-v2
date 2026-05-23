@@ -9,6 +9,42 @@ Construction project management MVP built on top of Bitrix24's REST API. A direc
 
 ---
 
+## Subsystems
+
+One repo, several cooperating subsystems. All share the same SQLite schema, the same Bitrix client, and the same domain model.
+
+**Backend (FastAPI, Python 3.12+)**
+
+| Subsystem | Path | Purpose |
+|---|---|---|
+| Bitrix24 client | [bitrix/](bitrix/) | Rate-limited HTTP client + method wrappers (tasks, lists, workgroups, disk) |
+| Excel import | [scripts/import_excel.py](scripts/import_excel.py), [utils/excel_parser.py](utils/excel_parser.py), [utils/cascade.py](utils/cascade.py) | Excel v3/v4 → Bitrix workgroup + universal lists + CRM tasks |
+| Reverse sync | [app/services/sync_from_bitrix.py](app/services/sync_from_bitrix.py) | Pull existing Bitrix workgroups + lists into local SQLite |
+| REST API | [app/routes/](app/routes/) | Domain routers: agent, dashboard, projects, imports, reports, sync |
+| Local DB | [db/](db/) | SQLite (aiosqlite) — 10 tables, async repo layer |
+| AI agent | [app/agent/](app/agent/) | LLM loop, tool registry (read + write), audit log, SSE streaming |
+| Procurement | [app/purchase_requests.py](app/purchase_requests.py), [app/approval_page.py](app/approval_page.py) | Buyer requests → approver decision (web + Telegram) |
+| Notifications | [app/notifications/](app/notifications/) | Telegram alerts (price/consumption/schedule) + daily 09:00 digest |
+| Telegram bots | [app/telegram_bot.py](app/telegram_bot.py), [app/telegram_agent.py](app/telegram_agent.py) | Procurement callbacks + director-agent adapter |
+
+**Frontend (React 19 + Vite + Tailwind + Recharts)** — [frontend/](frontend/)
+
+| Route | Page | Purpose |
+|---|---|---|
+| `/` | [DashboardPage.tsx](frontend/src/pages/DashboardPage.tsx) | Portfolio KPIs + per-project plan/fact bars |
+| `/projects/new` | [CreateProjectPage.tsx](frontend/src/pages/CreateProjectPage.tsx) | New project form |
+| `/projects/:id` | [ProjectDetailPage.tsx](frontend/src/pages/ProjectDetailPage.tsx) | Tabs: Overview / Materials / Labor / Equipment / Stages |
+| `/ai` | [AiPage.tsx](frontend/src/pages/AiPage.tsx) | AI assistant chat (SSE stream + write-action confirmation cards) |
+| `/foreman-report` | [ForemanPage.tsx](frontend/src/pages/ForemanPage.tsx) | Foreman daily report form (alt to Bitrix iframe widget) |
+| `/procurement` | [ProcurementPage.tsx](frontend/src/pages/ProcurementPage.tsx) | Buyer request editor + approver queue |
+| `/upload` | [UploadPage.tsx](frontend/src/pages/UploadPage.tsx) | Excel upload + Bitrix sync |
+
+**Tests** — backend `tests/` (32 files, pytest-asyncio) · frontend `frontend/src/**/*.test.tsx` (26 files, Vitest)
+
+**Demo / seed scripts** — [scripts/seed_demo_data.py](scripts/seed_demo_data.py), [scripts/seed_demo_realistic.py](scripts/seed_demo_realistic.py), [scripts/seed_lag_demo.py](scripts/seed_lag_demo.py). Idempotent; safe to re-run.
+
+---
+
 ## How It Works
 
 ### 1. Import Pipeline
