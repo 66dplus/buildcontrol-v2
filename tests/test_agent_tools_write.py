@@ -67,9 +67,8 @@ async def test_create_task_calls_bitrix_returns_id(db_with_project):
 @pytest.mark.asyncio
 async def test_create_task_is_write_tool():
     import app.agent.tools.create_task
-    from app.agent.tools import TOOL_REGISTRY
-    _, _, is_write = TOOL_REGISTRY["create_task"]
-    assert is_write
+    from app.agent.tools import is_write_tool
+    assert is_write_tool("create_task")
 
 
 @pytest.mark.asyncio
@@ -105,9 +104,8 @@ async def test_add_comment_calls_bitrix(db_with_project):
 @pytest.mark.asyncio
 async def test_add_comment_is_write_tool():
     import app.agent.tools.add_comment
-    from app.agent.tools import TOOL_REGISTRY
-    _, _, is_write = TOOL_REGISTRY["add_comment"]
-    assert is_write
+    from app.agent.tools import is_write_tool
+    assert is_write_tool("add_comment")
 
 
 @pytest.mark.asyncio
@@ -125,9 +123,8 @@ async def test_assign_user_calls_tasks_update(db_with_project):
 @pytest.mark.asyncio
 async def test_assign_user_is_write_tool():
     import app.agent.tools.assign_user
-    from app.agent.tools import TOOL_REGISTRY
-    _, _, is_write = TOOL_REGISTRY["assign_user"]
-    assert is_write
+    from app.agent.tools import is_write_tool
+    assert is_write_tool("assign_user")
 
 
 @pytest.mark.asyncio
@@ -143,9 +140,8 @@ async def test_move_task_stage_calls_movetask(db_with_project):
 @pytest.mark.asyncio
 async def test_move_task_stage_is_write_tool():
     import app.agent.tools.move_task_stage
-    from app.agent.tools import TOOL_REGISTRY
-    _, _, is_write = TOOL_REGISTRY["move_task_stage"]
-    assert is_write
+    from app.agent.tools import is_write_tool
+    assert is_write_tool("move_task_stage")
 
 
 @pytest.mark.asyncio

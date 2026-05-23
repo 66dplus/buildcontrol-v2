@@ -1,9 +1,11 @@
 """Tests for the tool registry."""
 import asyncio
 
+import pytest
+
 
 def test_register_adds_tool():
-    from app.agent.tools import _register, TOOL_REGISTRY
+    from app.agent.tools import _REGISTRY, _register, get_openai_tools, is_write_tool
 
     @_register({
         "type": "function",
@@ -16,14 +18,14 @@ def test_register_adds_tool():
     })
     async def _fn(**_): return "ok"
 
-    assert "_test_tool" in TOOL_REGISTRY
-    schema, _, is_write = TOOL_REGISTRY["_test_tool"]
-    assert schema["function"]["name"] == "_test_tool"
-    assert not is_write
+    assert "_test_tool" in _REGISTRY
+    specs = {t["function"]["name"]: t for t in get_openai_tools()}
+    assert specs["_test_tool"]["function"]["name"] == "_test_tool"
+    assert not is_write_tool("_test_tool")
 
 
 def test_register_marks_write_tools():
-    from app.agent.tools import _register, TOOL_REGISTRY
+    from app.agent.tools import _register, is_write_tool
 
     @_register({
         "type": "function",
@@ -33,8 +35,7 @@ def test_register_marks_write_tools():
     })
     async def _wfn(**_): return "written"
 
-    _, _, is_write = TOOL_REGISTRY["_write_t"]
-    assert is_write
+    assert is_write_tool("_write_t")
 
 
 def test_dispatch_calls_handler():
@@ -52,7 +53,7 @@ def test_dispatch_calls_handler():
     assert result == {"dispatched": True}
 
 
-def test_dispatch_unknown_returns_error():
+def test_dispatch_unknown_raises_keyerror():
     from app.agent.tools import dispatch
-    result = asyncio.get_event_loop().run_until_complete(dispatch("nonexistent", "{}"))
-    assert "error" in result
+    with pytest.raises(KeyError, match="Unknown tool: nonexistent"):
+        asyncio.get_event_loop().run_until_complete(dispatch("nonexistent", "{}"))
