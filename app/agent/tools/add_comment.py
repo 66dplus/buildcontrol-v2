@@ -44,6 +44,12 @@ async def _add_comment_tool(
     },
     "write": True,
 })
-async def _add_comment_registered(task_id: int, message: str, **_: Any) -> dict[str, Any]:
+async def _add_comment_registered(
+    task_id: int, message: str,
+    _session_id: Optional[str] = None, **_: Any,
+) -> dict[str, Any]:
     async with BitrixClient() as client:
-        return await _add_comment_tool(client=client, task_id=task_id, message=message)
+        return await _add_comment_tool(
+            client=client, task_id=task_id, message=message,
+            session_id=_session_id,
+        )

@@ -45,7 +45,11 @@ async def _move_task_stage_tool(
     "write": True,
 })
 async def _move_task_stage_registered(
-    task_id: int, stage_id: int, **_: Any
+    task_id: int, stage_id: int,
+    _session_id: Optional[str] = None, **_: Any,
 ) -> dict[str, Any]:
     async with BitrixClient() as client:
-        return await _move_task_stage_tool(client=client, task_id=task_id, stage_id=stage_id)
+        return await _move_task_stage_tool(
+            client=client, task_id=task_id, stage_id=stage_id,
+            session_id=_session_id,
+        )

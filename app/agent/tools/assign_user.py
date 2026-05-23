@@ -46,6 +46,12 @@ async def _assign_user_tool(
     },
     "write": True,
 })
-async def _assign_user_registered(task_id: int, user_id: int, **_: Any) -> dict[str, Any]:
+async def _assign_user_registered(
+    task_id: int, user_id: int,
+    _session_id: Optional[str] = None, **_: Any,
+) -> dict[str, Any]:
     async with BitrixClient() as client:
-        return await _assign_user_tool(client=client, task_id=task_id, user_id=user_id)
+        return await _assign_user_tool(
+            client=client, task_id=task_id, user_id=user_id,
+            session_id=_session_id,
+        )

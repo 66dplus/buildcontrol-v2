@@ -79,7 +79,7 @@ async def run_agent(
                     args = json.loads(args_json) if args_json else {}
                     yield {"type": "tool_call", "name": name, "args": args,
                            "write": is_write_tool(name)}
-                    result = await dispatch(name, args_json)
+                    result = await dispatch(name, args_json, session_id=session_id)
                     yield {"type": "tool_result", "name": name, "result": result}
                     messages.append({
                         "role": "tool",

@@ -69,10 +69,12 @@ async def _create_task_tool(
 })
 async def _create_task_registered(
     title: str, group_id: int, responsible_id: int = 1,
-    deadline: Optional[str] = None, description: Optional[str] = None, **_: Any,
+    deadline: Optional[str] = None, description: Optional[str] = None,
+    _session_id: Optional[str] = None, **_: Any,
 ) -> dict[str, Any]:
     async with BitrixClient() as client:
         return await _create_task_tool(
             client=client, title=title, responsible_id=responsible_id,
             group_id=group_id, deadline=deadline, description=description,
+            session_id=_session_id,
         )

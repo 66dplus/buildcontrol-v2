@@ -146,3 +146,43 @@ async def test_move_task_stage_is_write_tool():
     from app.agent.tools import TOOL_REGISTRY
     _, _, is_write = TOOL_REGISTRY["move_task_stage"]
     assert is_write
+
+
+@pytest.mark.asyncio
+async def test_dispatch_threads_session_id_into_audit_log(db_with_project, monkeypatch):
+    """Regression: dispatch(..., session_id=X) must reach the audit_log row.
+
+    Before this guard was added, `core.run_agent` collected a session_id but
+    `dispatch()` dropped it, so every production write-tool audit row landed
+    with session_id=NULL. The fix threads it through as `_session_id` in the
+    tool's kwargs; this test exercises the full path end-to-end via dispatch().
+    """
+    import app.agent.tools.add_comment as add_comment_module
+    from app.agent.tools import dispatch
+
+    dummy = DummyClient()
+
+    class _BitrixCtx:
+        async def __aenter__(self_inner):
+            return dummy
+
+        async def __aexit__(self_inner, *_):
+            return None
+
+    monkeypatch.setattr(add_comment_module, "BitrixClient", lambda: _BitrixCtx())
+
+    await dispatch(
+        "add_comment",
+        '{"task_id": 42, "message": "regression"}',
+        session_id="sess-abc",
+    )
+
+    async with aiosqlite.connect(str(db_with_project)) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT session_id FROM audit_log WHERE tool_name='add_comment'"
+        ) as cur:
+            rows = await cur.fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "sess-abc"

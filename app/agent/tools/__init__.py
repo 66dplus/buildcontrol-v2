@@ -6,7 +6,7 @@ Tools register via the ``@_register(spec)`` decorator at import time.
 from __future__ import annotations
 
 import json
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 ToolFn = Callable[..., Awaitable[Any]]
 
@@ -41,8 +41,19 @@ def is_write_tool(name: str) -> bool:
     return bool(entry and entry["write"])
 
 
-async def dispatch(name: str, args_json: str) -> Any:
-    """Invoke a registered tool by name with JSON-encoded args."""
+async def dispatch(
+    name: str,
+    args_json: str,
+    *,
+    session_id: Optional[str] = None,
+) -> Any:
+    """Invoke a registered tool by name with JSON-encoded args.
+
+    `session_id` is threaded into kwargs under the reserved name `_session_id`
+    so write-tool wrappers can forward it into their audit-log writes. The
+    underscore prefix prevents collision with any model-supplied argument
+    name (model schemas never declare underscore-prefixed parameters).
+    """
     entry = _REGISTRY.get(name)
     if not entry:
         raise KeyError(f"Unknown tool: {name}")
@@ -52,4 +63,6 @@ async def dispatch(name: str, args_json: str) -> Any:
         raise ValueError(f"Invalid JSON args for tool {name}: {e}") from e
     if not isinstance(args, dict):
         raise ValueError(f"Tool {name} expects a JSON object, got {type(args).__name__}")
+    if session_id is not None:
+        args["_session_id"] = session_id
     return await entry["fn"](**args)
