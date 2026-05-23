@@ -894,7 +894,7 @@ async def list_pending_across_projects(
                     "qty": float(primary.get("qty") or 0),
                     "unit": primary.get("unit") or "",
                     "total_sum": _items_total(items),
-                    "file_url": "",
+                    "file_url": r.get("file_url") or "",
                 })
             out.sort(key=lambda r: r["date"] or "", reverse=True)
             return out

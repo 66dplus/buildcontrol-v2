@@ -59,10 +59,16 @@ export function ChatPanel({
   useEffect(() => () => ctrlRef.current?.abort(), []);
 
   useEffect(() => {
-    if (autoSend && initialMessage && !sentInitialRef.current) {
+    if (!autoSend || !initialMessage || sentInitialRef.current) return;
+    // Defer one tick so React StrictMode's mount→unmount→remount cycle can
+    // cancel this before any network request goes out. Without the delay the
+    // first fetch is started, then aborted on cleanup, and the ref-guard
+    // (which persists across the double-invoke) blocks the retry.
+    const timer = setTimeout(() => {
       sentInitialRef.current = true;
       send(initialMessage);
-    }
+    }, 0);
+    return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

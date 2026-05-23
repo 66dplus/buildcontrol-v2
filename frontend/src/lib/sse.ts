@@ -111,7 +111,8 @@ export function streamChat(
         buffer = rest;
         for (const ev of events) {
           if (ev.event === "chunk") {
-            const t = (ev.data as { text?: string })?.text;
+            const d = ev.data as { text?: string; content?: string };
+            const t = d?.content ?? d?.text;
             if (typeof t === "string") handlers.onChunk(t);
           } else if (ev.event === "action") {
             handlers.onAction?.(ev.data as PendingAction);
@@ -119,7 +120,8 @@ export function streamChat(
             handlers.onDone?.();
             return;
           } else if (ev.event === "error") {
-            handlers.onError?.((ev.data as { message?: string })?.message ?? "stream error");
+            const d = ev.data as { message?: string; content?: string };
+            handlers.onError?.(d?.content ?? d?.message ?? "stream error");
             return;
           }
         }
