@@ -7,7 +7,6 @@ Registers all domain routers and keeps only the shared/utility endpoints:
   GET  /api/projects/{id}/members — workgroup members (Bitrix call)
   POST /api/agent/assign-preview  — NL assignment parsing via LLM
   POST /api/agent/apply-assignments — apply phase assignments to Bitrix tasks
-  POST /api/agent/confirm — execute a pending write-action
   (SPA catch-all and static-file mounts)
 
 Domain routes live in app/routes/:
@@ -15,7 +14,7 @@ Domain routes live in app/routes/:
   projects.py  — /api/projects and /api/projects/{id}/* data endpoints
   reports.py   — /api/report, /api/purchase-request, /api/buyer-report
   imports.py   — POST /upload, GET /api/import-status/{job_id}
-  agent.py     — POST /api/agent/chat
+  agent.py     — POST /api/agent/chat, POST /api/agent/confirm
 """
 
 import logging
@@ -316,34 +315,6 @@ async def api_apply_assignments(request: Request) -> JSONResponse:
     )
 
     return JSONResponse(content={"updated": updated, "errors": errors})
-
-
-@app.post("/api/agent/confirm")
-async def api_agent_confirm(request: Request) -> JSONResponse:
-    """
-    Execute a pending write-action after director confirmation.
-
-    Body: ``{"action_id": "<uuid>"}``
-    Returns: ``{"ok": true, "result": {...}}`` or ``{"ok": false, "error": "..."}``
-    """
-    from app.agent_tools import execute_pending_action
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-    action_id = (body.get("action_id") or "").strip()
-    if not action_id:
-        raise HTTPException(status_code=400, detail="action_id is required")
-
-    result = await execute_pending_action(action_id)
-    if "error" in result:
-        if result["error"] == "action_not_found":
-            raise HTTPException(status_code=404, detail="Action not found or already executed")
-        return JSONResponse({"ok": False, "error": result["error"]}, status_code=500)
-
-    return JSONResponse({"ok": True, "result": result})
 
 
 # ---------------------------------------------------------------------------

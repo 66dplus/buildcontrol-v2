@@ -4,8 +4,14 @@ Event types:
     {"type": "text", "content": str}
     {"type": "tool_call", "name": str, "args": dict, "write": bool}
     {"type": "tool_result", "name": str, "result": Any}
+    {"type": "action", "action_id": str, "display": dict}   # write-tool confirmation gate
     {"type": "done"}
     {"type": "error", "content": str}
+
+Write tools never run inside this loop. When the model emits a write
+tool call we queue it via app.agent.pending and yield an "action" event;
+the loop then ends. The SPA confirms via POST /api/agent/confirm, which
+runs dispatch() with full audit-log threading.
 """
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ import app.agent.tools.create_task  # noqa: F401
 import app.agent.tools.add_comment  # noqa: F401
 import app.agent.tools.assign_user  # noqa: F401
 import app.agent.tools.move_task_stage  # noqa: F401
+from app.agent import pending
 from app.agent.tools import dispatch, get_openai_tools, is_write_tool
 
 from config import settings
@@ -77,8 +84,19 @@ async def run_agent(
                     name = call.function.name
                     args_json = call.function.arguments
                     args = json.loads(args_json) if args_json else {}
-                    yield {"type": "tool_call", "name": name, "args": args,
-                           "write": is_write_tool(name)}
+                    if is_write_tool(name):
+                        # Gate: queue, emit confirmation event, end stream.
+                        # The action runs only after POST /api/agent/confirm.
+                        payload = pending.queue_action(name, args, session_id)
+                        yield {
+                            "type": "action",
+                            "action_id": payload["action_id"],
+                            "display": payload["display"],
+                        }
+                        yield {"type": "done"}
+                        return
+                    # Read tool: dispatch immediately so the model sees the result.
+                    yield {"type": "tool_call", "name": name, "args": args, "write": False}
                     result = await dispatch(name, args_json, session_id=session_id)
                     yield {"type": "tool_result", "name": name, "result": result}
                     messages.append({

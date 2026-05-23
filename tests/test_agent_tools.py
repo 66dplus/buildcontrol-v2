@@ -28,16 +28,20 @@ def _clear_pending():
 # ---------------------------------------------------------------------------
 
 def test_confirm_executes_known_action(monkeypatch) -> None:
-    """A stored pending action is executed and removed from the store."""
+    """A stored pending action is approved via the new app.agent.pending module."""
+    from app.agent import pending as new_pending
+
     action_id = str(uuid.uuid4())
     executed: list[str] = []
 
-    async def fake_execute(aid: str) -> dict:
+    async def fake_approve(aid: str) -> dict:
         executed.append(aid)
-        return {"ok": True, "action_id": aid}
+        return {"ok": True, "result": {"action_id": aid}}
 
-    monkeypatch.setattr("app.agent_tools.execute_pending_action", fake_execute)
-    PENDING_ACTIONS[action_id] = {"action_type": "add_comment", "params": {}}
+    monkeypatch.setattr(new_pending, "approve", fake_approve)
+    new_pending.PENDING_ACTIONS[action_id] = {
+        "tool_name": "add_comment", "args": {}, "session_id": None,
+    }
 
     r = client.post("/api/agent/confirm", json={"action_id": action_id})
     assert r.status_code == 200
@@ -46,14 +50,13 @@ def test_confirm_executes_known_action(monkeypatch) -> None:
     assert executed == [action_id]
 
 
-def test_confirm_returns_404_for_unknown_action(monkeypatch) -> None:
-    async def fake_execute(aid: str) -> dict:
-        return {"error": "action_not_found"}
-
-    monkeypatch.setattr("app.agent_tools.execute_pending_action", fake_execute)
-
+def test_confirm_returns_404_for_unknown_action() -> None:
+    """An unknown action_id resolves to 404 (matches the legacy route's contract)."""
+    from app.agent import pending as new_pending
+    new_pending.PENDING_ACTIONS.clear()
     r = client.post("/api/agent/confirm", json={"action_id": "no-such-id"})
     assert r.status_code == 404
+    assert r.json()["error"] == "action_not_found"
 
 
 def test_confirm_rejects_missing_action_id() -> None:

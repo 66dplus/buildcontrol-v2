@@ -114,3 +114,57 @@ async def test_run_agent_error_on_llm_exception(db_path, monkeypatch):
         from app.agent.core import run_agent
         events = await _collect(run_agent("Crash", project_id=None, session_id="s5"))
     assert any(e["type"] == "error" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_write_tool_gated_yields_action_event(db_path, monkeypatch):
+    """When the model calls a write tool, run_agent must NOT dispatch — it must
+    queue the action, emit an `action` event, and end the stream. Dispatch only
+    runs later via POST /api/agent/confirm."""
+    monkeypatch.setattr(settings, "openrouter_api_key", "fake-key")
+
+    # Model emits a single create_task tool call.
+    tc = MagicMock()
+    tc.function.name = "create_task"
+    tc.function.arguments = '{"title": "Test", "group_id": 5}'
+    tc.id = "call_write"
+
+    msg1 = MagicMock()
+    msg1.tool_calls = [tc]
+    msg1.model_dump.return_value = {"role": "assistant", "tool_calls": []}
+
+    c1 = MagicMock(); c1.finish_reason = "tool_calls"; c1.message = msg1
+    r1 = MagicMock(); r1.choices = [c1]
+
+    # If dispatch ever runs from inside the loop, fail the test loudly.
+    from app.agent import pending
+    pending.PENDING_ACTIONS.clear()
+
+    async def fail_if_called(*a, **kw):
+        raise AssertionError(
+            "dispatch() must not run inside run_agent for write tools — "
+            "the confirmation gate is bypassed"
+        )
+
+    monkeypatch.setattr("app.agent.core.dispatch", fail_if_called)
+
+    with patch("app.agent.core.AsyncOpenAI") as MockOAI:
+        MockOAI.return_value.chat.completions.create = AsyncMock(side_effect=[r1])
+        from app.agent.core import run_agent
+        import app.agent.tools.create_task  # noqa: F401  ensure registered
+        events = await _collect(run_agent("Create it", project_id=5, session_id="s-gate"))
+
+    types = [e["type"] for e in events]
+    assert "action" in types
+    assert "tool_result" not in types
+    assert "done" in types
+
+    action_ev = next(e for e in events if e["type"] == "action")
+    assert isinstance(action_ev["action_id"], str)
+    assert "title" in action_ev["display"]
+    # Action is sitting in the store for /api/agent/confirm to pick up.
+    assert action_ev["action_id"] in pending.PENDING_ACTIONS
+    stored = pending.PENDING_ACTIONS[action_ev["action_id"]]
+    assert stored["tool_name"] == "create_task"
+    assert stored["session_id"] == "s-gate"
+    pending.PENDING_ACTIONS.clear()

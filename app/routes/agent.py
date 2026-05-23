@@ -6,8 +6,9 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.agent import pending
 from app.agent.core import run_agent
 
 router = APIRouter(prefix="", tags=["agent"])
@@ -24,6 +25,7 @@ _EVENT_NAMES: dict[str, str] = {
     "text": "chunk",
     "tool_call": "tool_call",
     "tool_result": "tool_result",
+    "action": "action",
     "done": "done",
     "error": "error",
 }
@@ -78,3 +80,32 @@ async def api_agent_chat(request: Request) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/api/agent/confirm")
+async def api_agent_confirm(request: Request) -> JSONResponse:
+    """Approve or reject a pending write action.
+
+    Body: ``{"action_id": "<uuid>", "decision": "approve"|"reject"}``
+    (``decision`` is optional and defaults to ``approve`` for backwards-compat
+    with the existing SPA, which currently POSTs only ``action_id``.)
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action_id = (body.get("action_id") or "").strip()
+    decision = (body.get("decision") or "approve").strip().lower()
+    if not action_id:
+        return JSONResponse({"ok": False, "error": "missing action_id"}, status_code=400)
+    if decision == "reject":
+        result = await pending.reject(action_id)
+    else:
+        result = await pending.approve(action_id)
+    if result.get("ok"):
+        return JSONResponse(result, status_code=200)
+    # Match the legacy route's HTTP semantics so existing clients/tests
+    # see the same status codes: 404 for an unknown id, 500 otherwise.
+    if result.get("error") == "action_not_found":
+        return JSONResponse(result, status_code=404)
+    return JSONResponse(result, status_code=500)
