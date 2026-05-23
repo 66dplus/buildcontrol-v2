@@ -12,7 +12,7 @@ import logging
 
 import httpx
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app._ui_styles import BASE_CSS, FONT_LINKS
 from config import settings
@@ -123,6 +123,150 @@ async def widget(
     Shows a file upload form; on submit sends the file to /upload API.
     """
     return HTMLResponse(_widget_page())
+
+
+@router.api_route("/app", methods=["GET", "POST"])
+async def bitrix_app_spa() -> RedirectResponse:
+    """
+    Bitrix24 iframe entry point for the full React SPA.
+
+    Bitrix POSTs auth params (AUTH_ID, DOMAIN, etc.) on first load. The demo
+    SPA does not call Bitrix REST directly, so we ignore them and hand the
+    iframe off to the SPA's BrowserRouter at the site root.
+
+    303 See Other converts the incoming POST into a GET on the redirect target.
+    """
+    return RedirectResponse(url="/", status_code=303)
+
+
+def _public_base_url(request: Request) -> str:
+    """Reconstruct the public-facing base URL (scheme://host) from the request.
+
+    When the app is reached through ngrok/cloudflared, the tunnel forwards
+    ``X-Forwarded-Host`` and ``X-Forwarded-Proto``; we honour those so the
+    placement handler points at the tunnel domain, not at localhost.
+    """
+    forwarded_host = request.headers.get("x-forwarded-host")
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_host:
+        scheme = forwarded_proto or "https"
+        return f"{scheme}://{forwarded_host}"
+    # Fall back to the Host header / request URL.
+    host = request.headers.get("host", "")
+    scheme = request.url.scheme or "https"
+    return f"{scheme}://{host}" if host else str(request.base_url).rstrip("/")
+
+
+@router.get("/install-app", response_class=HTMLResponse)
+async def install_app_get() -> HTMLResponse:
+    """Friendly check — Bitrix calls this URL via POST, not GET."""
+    return HTMLResponse(
+        "<h3>✅ Install endpoint is alive</h3>"
+        "<p>This URL only responds to <code>POST</code> from Bitrix24 during app install. "
+        "Paste it into Bitrix as «Путь для первоначальной установки» and save the form.</p>"
+    )
+
+
+@router.post("/install-app", response_class=HTMLResponse)
+async def install_app(request: Request) -> HTMLResponse:
+    """
+    Install handler for the React SPA placement (separate from /bitrix/install,
+    which binds the legacy foreman widget).
+
+    Bitrix24 POSTs here once after the user creates the local app and saves
+    the form. We register a LEFT_MENU placement that points at ``/bitrix/app``
+    on the current public base URL, then call ``BX24.installFinish()``.
+    """
+    form = await request.form()
+    raw = dict(form)
+
+    AUTH_ID = raw.get("AUTH_ID") or raw.get("auth[access_token]") or ""
+    DOMAIN = (
+        request.query_params.get("DOMAIN")
+        or raw.get("DOMAIN")
+        or raw.get("auth[domain]")
+        or ""
+    )
+
+    logger.info(
+        f"install-app called: DOMAIN={DOMAIN} AUTH_ID_present={bool(AUTH_ID)}"
+    )
+
+    if not AUTH_ID or not DOMAIN:
+        return HTMLResponse(
+            f"<h2>Install error</h2>"
+            f"<p>Missing AUTH_ID or DOMAIN. Keys: {list(raw.keys())}</p>",
+            status_code=400,
+        )
+
+    base_url = _public_base_url(request)
+    handler_url = f"{base_url}/bitrix/app"
+    bitrix_rest = f"https://{DOMAIN}/rest"
+
+    # Try a server-side placement.bind to LEFT_MENU so the app gets a sidebar
+    # icon. This requires the `placement` scope, which is not always exposed in
+    # every Bitrix24 portal. If it fails with insufficient_scope, we still
+    # finish install — the app is reachable from "Приложения" → "Локальные
+    # приложения" and from its admin-form "Открыть приложение" button.
+    bind_result: dict[str, Any] = {}
+    bind_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{bitrix_rest}/placement.bind",
+                json={
+                    "auth": AUTH_ID,
+                    "PLACEMENT": "LEFT_MENU",
+                    "HANDLER": handler_url,
+                    "TITLE": "BuildControl SPA",
+                    "LANG_ALL": {
+                        "ru": {"TITLE": "BuildControl SPA"},
+                        "en": {"TITLE": "BuildControl SPA"},
+                    },
+                },
+                headers={"Content-Type": "application/json"},
+            )
+            bind_result = resp.json()
+            bind_ok = "error" not in bind_result
+            logger.info(f"install-app placement.bind: {bind_result}")
+    except Exception as e:
+        logger.warning(f"install-app placement.bind raised: {e}")
+        bind_result = {"error": "exception", "error_description": str(e)}
+
+    status_block = (
+        f"<p>✅ <strong>В левом меню Bitrix24</strong> теперь есть пункт «BuildControl SPA».</p>"
+        if bind_ok
+        else (
+            f"<p>⚠️ <strong>placement.bind недоступен</strong> на этом портале "
+            f"(<code>{bind_result.get('error')}</code>). Иконка в левом меню не создаётся "
+            f"автоматически, но <strong>само приложение работает</strong>.</p>"
+            f"<p><strong>Как открыть SPA в Bitrix24:</strong></p>"
+            f"<ol>"
+            f"<li>В Bitrix24: <em>Приложения → Маркет → Локальные приложения</em> — там "
+            f"увидишь установленное приложение, клик откроет SPA в iframe.</li>"
+            f"<li>Или прямо: <a href='{handler_url}' target='_blank'>{handler_url}</a></li>"
+            f"</ol>"
+        )
+    )
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><title>BuildControl SPA installed</title>
+<script src="{BX24_JS_URL}"></script>
+<script>
+  if (typeof BX24 !== 'undefined') {{
+    BX24.install(function() {{ BX24.installFinish(); }});
+  }}
+</script>
+<style>body{{font-family:-apple-system,sans-serif;padding:24px;max-width:640px;margin:0 auto;color:#222;line-height:1.5}}
+h2{{margin-top:0}} code{{background:#f3f4f6;padding:2px 6px;border-radius:4px}}
+a{{color:#1d4ed8}}</style>
+</head>
+<body>
+<h2>BuildControl SPA — установка завершена</h2>
+{status_block}
+<p style="color:#6b7280;font-size:12px;margin-top:24px">Handler: <code>{handler_url}</code></p>
+<p style="color:#6b7280;font-size:12px">Bind result: <code>{bind_result}</code></p>
+</body></html>""")
 
 
 @router.get("/rebind", response_class=HTMLResponse)
